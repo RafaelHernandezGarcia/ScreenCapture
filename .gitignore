@@ -1,0 +1,35 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec.bak
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# User config (contains hotkey preference; copy config.example.json to config.json)
+config.json
+
+# Compiled native helper (build from source)
+sc_audio_helper
+
+# Cursor
+.cursor/
