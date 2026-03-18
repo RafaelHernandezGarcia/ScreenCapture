@@ -39,6 +39,9 @@ if [ "$OS_TYPE" = "Darwin" ]; then
     if [ -d "$SCRIPT_DIR/assets" ]; then
         cp "$SCRIPT_DIR/assets/"* "$INSTALL_DIR/assets/" 2>/dev/null || true
     fi
+    if [ -f "$SCRIPT_DIR/sc_audio_helper" ]; then
+        cp "$SCRIPT_DIR/sc_audio_helper" "$INSTALL_DIR/" 2>/dev/null || true
+    fi
 
     # Create virtual environment and install dependencies
     VENV_DIR="$INSTALL_DIR/.venv"
@@ -93,11 +96,11 @@ LAUNCHER_EOF
 </plist>
 PLIST_EOF
 
-    # Executable wrapper
+    # Executable wrapper (exec -a shows "ScreenCapture" instead of "Python" in Activity Monitor)
     cat > "$APP_DIR/Contents/MacOS/ScreenCapture" <<EXEC_EOF
 #!/bin/bash
 cd "$INSTALL_DIR"
-exec "$VENV_DIR/bin/python3" main.py
+exec -a "ScreenCapture" "$VENV_DIR/bin/python3" main.py
 EXEC_EOF
     chmod +x "$APP_DIR/Contents/MacOS/ScreenCapture"
 

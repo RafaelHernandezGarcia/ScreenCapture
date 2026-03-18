@@ -153,7 +153,7 @@ There are **two copies** of the codebase on macOS after installation:
 
 | Location | Purpose |
 |----------|---------|
-| `~/Downloads/ScreenCapture/` | **Development source** — where you edit code |
+| `~/Documents/ScreenCapture/` | **Development source** — where you edit code |
 | `/Applications/ScreenCapture.app/Contents/Resources/app/` | **Deployed app bundle** — what runs when you open the app |
 
 ### How the app bundle works
@@ -174,12 +174,11 @@ There are **two copies** of the codebase on macOS after installation:
         .venv/                    #     Self-contained virtual environment
 ```
 
-The launcher script at `Contents/MacOS/ScreenCapture` simply does:
+The launcher script at `Contents/MacOS/ScreenCapture` runs Python with the process name "ScreenCapture" (so it appears as a native app, not "Python"):
 ```bash
 DIR="$(dirname "$0")/../Resources/app"
 cd "$DIR"
-"$DIR/.venv/bin/python3" main.py &
-wait
+exec -a "ScreenCapture" "$DIR/.venv/bin/python3" main.py
 ```
 
 ### The sync problem
@@ -191,7 +190,7 @@ When you edit files in the **development source**, the **app bundle does NOT upd
 **Option 1: Manual sync** (quick)
 ```bash
 # Copy updated files from source to app bundle
-SRC="$HOME/Downloads/ScreenCapture"
+SRC="$HOME/Documents/ScreenCapture"
 APP="/Applications/ScreenCapture.app/Contents/Resources/app"
 
 cp "$SRC"/*.py "$APP/"
@@ -222,10 +221,10 @@ mv /Applications/ScreenCapture.app/Contents/Resources/app/.venv /tmp/screencap-v
 
 # Replace with symlink
 rm -rf /Applications/ScreenCapture.app/Contents/Resources/app
-ln -s "$HOME/Downloads/ScreenCapture" /Applications/ScreenCapture.app/Contents/Resources/app
+ln -s "$HOME/Documents/ScreenCapture" /Applications/ScreenCapture.app/Contents/Resources/app
 
 # Restore venv into source dir (if it doesn't already have one)
-mv /tmp/screencap-venv "$HOME/Downloads/ScreenCapture/.venv"
+mv /tmp/screencap-venv "$HOME/Documents/ScreenCapture/.venv"
 ```
 
 Now editing the source and running the app always use the same files. The `.venv` lives inside your source directory and is used by both `run.sh` and the app bundle.
@@ -428,7 +427,7 @@ Go to **System Settings > Privacy & Security** to manage these.
 ## Troubleshooting
 
 ### "I changed the code but nothing happened"
-You're probably editing the source in `~/Downloads/ScreenCapture/` but running from the app bundle at `/Applications/ScreenCapture.app/`. See [the sync section](#the-sync-problem) above.
+You're probably editing the source in `~/Documents/ScreenCapture/` but running from the app bundle at `/Applications/ScreenCapture.app/`. See [the sync section](#the-sync-problem) above.
 
 ### The red recording border disappears when I click
 This was a bug caused by `NSWindow.hidesOnDeactivate` defaulting to `True`. Fixed by explicitly setting `setHidesOnDeactivate_(False)` in `_configure_nswindow()`.
