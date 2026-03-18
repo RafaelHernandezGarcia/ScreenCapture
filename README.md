@@ -199,31 +199,11 @@ cp "$SRC/sc_audio_helper" "$APP/"
 cp "$SRC/requirements.txt" "$APP/"
 ```
 
-**Option 2: Full sync script** (safer)
+**Option 2: Use sync.sh** (recommended)
 ```bash
-#!/bin/bash
-SRC="$HOME/Downloads/ScreenCapture"
-APP="/Applications/ScreenCapture.app/Contents/Resources/app"
-
-echo "Syncing source → app bundle..."
-
-# Quit ScreenCapture (safe — does not affect Cursor or other apps)
-osascript -e 'quit app "ScreenCapture"' 2>/dev/null
-sleep 2
-pkill -f "ScreenCapture.app" 2>/dev/null
-
-# Sync files
-cp "$SRC"/*.py "$APP/"
-cp "$SRC/sc_audio_helper" "$APP/" 2>/dev/null
-cp "$SRC/requirements.txt" "$APP/"
-cp -r "$SRC/assets/" "$APP/assets/" 2>/dev/null
-
-# Install any new deps
-"$APP/.venv/bin/pip" install -r "$APP/requirements.txt" --quiet
-
-echo "Done. Relaunch the app."
-open /Applications/ScreenCapture.app
+./sync.sh
 ```
+This script quits the app, copies all files, reinstalls deps, and is ready for relaunch. Pass a custom path: `./sync.sh /path/to/ScreenCapture`
 
 **Option 3: Develop directly in the app bundle**
 
@@ -250,7 +230,54 @@ mv /tmp/screencap-venv "$HOME/Downloads/ScreenCapture/.venv"
 
 Now editing the source and running the app always use the same files. The `.venv` lives inside your source directory and is used by both `run.sh` and the app bundle.
 
-> **Recommendation:** Option 4 (symlink) is the cleanest for active development. Option 1 is fine for occasional changes.
+> **Recommendation:** Option 4 (symlink) is the cleanest for active development. Option 2 (sync.sh) is best for occasional changes.
+
+---
+
+## Windows Support
+
+Windows is partially supported. The following works today:
+
+| Feature | Status |
+|---------|--------|
+| Screenshot (region select, annotations, copy/save) | ✅ Works |
+| Screen recording (video + cursor) | ✅ Works |
+| Microphone capture | ✅ Works |
+| Webcam PiP overlay | ✅ Works |
+| Live drawing during recording | ✅ Works |
+| Global hotkey (via ctypes/pywin32) | ✅ Works |
+| System tray, Start Menu, Startup shortcut | ✅ Works |
+| **System audio capture** (browser, apps, etc.) | ❌ Not implemented |
+
+### What still needs to be done (Windows)
+
+**1. System audio capture**
+
+On macOS, system audio uses ScreenCaptureKit via a native Objective-C helper. Windows has no direct equivalent. Options for implementation:
+
+- **Windows Audio Session API (WASAPI)** — `pywin32` or `comtypes` can access `IAudioCaptureClient` to capture the default loopback device (what you hear). Libraries like `sounddevice` or `pyaudioworkpiece` may help.
+- **OBS-style approach** — Use `obs-python` or similar, but adds heavy dependencies.
+- **NAudio** — .NET library; would require a separate helper process or Python bindings.
+- **Reference**: The macOS flow in `audio_helper.py` → `sc_audio_helper` subprocess → raw PCM file. A Windows helper could follow the same pattern: subprocess writes raw PCM, `audio_helper.py` reads and mixes with mic.
+
+**2. Platform-specific code locations**
+
+| File | Windows-specific logic |
+|------|------------------------|
+| `main.py` | `_setup_hotkey_windows()` (RegisterHotKey), DPI scaling env vars, `SetProcessDpiAwarenessContext` |
+| `recorder.py` | `set_drawing_active()` uses `WS_EX_TRANSPARENT` via `ctypes.windll.user32` for click-through overlay |
+| `audio_helper.py` | `SystemAudioCapture` raises `ImportError` on non-macOS; add a Windows implementation that returns empty or uses a loopback capture |
+
+**3. Testing on Windows**
+
+- Run `install.bat` to install to `%LOCALAPPDATA%\ScreenCapture\`
+- No native binary to compile (unlike macOS)
+- Use `run.bat` for development
+- Check that `config.json` is created in the install directory
+
+**4. DPI / scaling**
+
+`main.py` sets `QT_AUTO_SCREEN_SCALE_FACTOR=0` and related env vars on Windows to avoid zoomed/blurry UI. If you see scaling issues, verify these are applied before `QApplication` is created.
 
 ---
 
@@ -470,6 +497,9 @@ By design. `LSUIElement = true` in `Info.plist` makes it a menu bar-only app. Lo
 ## Known Issues / Remaining Work
 
 These are open issues as of 2026-03-17 that need further investigation:
+
+### Windows
+- **System audio capture** — Not implemented. See [Windows Support](#windows-support) above for implementation options (WASAPI, loopback capture).
 
 ### Stability
 1. **Duplicate ObjC class conflict** — PyAV and OpenCV both bundle `libavdevice` with the same ObjC class names (`AVFFrameReceiver`, `AVFAudioReceiver`). macOS warns this "may cause spurious casting failures and mysterious crashes." This could be the source of remaining instability. Fix: switch to `opencv-python-headless` or resolve the dylib conflict.
