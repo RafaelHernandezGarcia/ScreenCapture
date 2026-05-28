@@ -11,3 +11,12 @@ sounddevice>=0.4.6
 opencv-python-headless>=4.8.0
 pyobjc-framework-ScreenCaptureKit>=10.0; sys_platform == "darwin"
 pyobjc-framework-CoreMedia>=10.0; sys_platform == "darwin"
+# AVFoundation is required for camera/mic permission + camera enumeration.
+# Without it the Camera menu shows "No cameras detected" and the webcam
+# permission prompt can't fire.
+pyobjc-framework-AVFoundation>=10.0; sys_platform == "darwin"
+# Cocoa (AppKit/Foundation), Quartz, and ApplicationServices power the tray,
+# overlays, NSWindow config, clipboard, and Accessibility checks.
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10.0; sys_platform == "darwin"

@@ -25,11 +25,24 @@ class CountdownOverlay(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Show without activating so macOS doesn't switch to the app's home
+        # Space and reveal the desktop wallpaper behind the countdown.
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setGeometry(screen_geo)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(800)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Keep the countdown on every Space and above normal windows so it
+        # doesn't pull the user to another Space (desktop-reveal bug).
+        try:
+            from recorder import _configure_nswindow
+            _configure_nswindow(self, click_through=False, level=25)
+        except Exception:
+            pass
 
     def _tick(self):
         self._count -= 1

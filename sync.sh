@@ -2,13 +2,13 @@
 # Sync development source → macOS app bundle (run after making changes)
 SRC="${1:-$HOME/Documents/ScreenCapture}"
 
-# Prefer /Applications (system-wide) then ~/Applications (install.sh default)
-if [[ -d "/Applications/ScreenCapture.app/Contents/Resources/app" ]]; then
-  APP="/Applications/ScreenCapture.app/Contents/Resources/app"
-  APP_OPEN="/Applications/ScreenCapture.app"
-elif [[ -d "$HOME/Applications/ScreenCapture" ]]; then
+# Prefer ~/Applications (install.sh default) then /Applications
+if [[ -d "$HOME/Applications/ScreenCapture" ]]; then
   APP="$HOME/Applications/ScreenCapture"
   APP_OPEN="$HOME/Applications/ScreenCapture.app"
+elif [[ -d "/Applications/ScreenCapture.app/Contents/Resources/app" ]]; then
+  APP="/Applications/ScreenCapture.app/Contents/Resources/app"
+  APP_OPEN="/Applications/ScreenCapture.app"
 else
   echo "App not found. Run install.sh first from project dir."
   echo "  cd $SRC && ./install.sh"

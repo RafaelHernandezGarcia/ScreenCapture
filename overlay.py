@@ -36,8 +36,11 @@ def _save_config(cfg):
     with open(_CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
 
-# On macOS, Cmd is the standard modifier; on Windows, Ctrl
-MODIFIER_KEY = Qt.KeyboardModifier.MetaModifier if IS_MACOS else Qt.KeyboardModifier.ControlModifier
+# Qt maps the macOS Command key to Qt.ControlModifier by default (it swaps
+# Ctrl/Cmd on macOS, so physical Control arrives as MetaModifier). Accept
+# BOTH so ⌘C / ⌘S / ⌘Z work on macOS and Ctrl+… works on Windows —
+# regardless of the swap setting.
+MODIFIER_KEY = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
 
 # Import tools from your existing tools.py
 from tools import (
@@ -437,6 +440,8 @@ class OverlayWindow(QWidget):
         )
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
+        # Must be focusable or keyPressEvent (Esc / ⌘C / ⌘S / ⌘Z) never fires.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def _create_toolbars(self):
         # Vertical Toolbar (Tools)
@@ -572,15 +577,48 @@ class OverlayWindow(QWidget):
             }}
         """)
 
+    def _set_overlay_level(self, level: int):
+        """Set this overlay's underlying NSWindow stacking level (macOS).
+
+        The overlay normally sits at level 25 (above normal windows) so it
+        covers everything during capture. But that also hides any child
+        dialog — like the color picker — *behind* it. We drop the level
+        while a dialog is open, then restore it.
+        """
+        if not IS_MACOS:
+            return
+        try:
+            import ctypes as _ct
+            import objc
+            ptr = int(self.winId())
+            if ptr == 0:
+                return
+            nswindow = objc.objc_object(c_void_p=_ct.c_void_p(ptr)).window()
+            if nswindow is not None:
+                nswindow.setLevel_(level)
+        except Exception as e:
+            print(f"_set_overlay_level: {e}")
+
     def _pick_color(self):
-        popup = _ColorPickerPopup(self.current_color, self)
-        if popup.exec() == QDialog.DialogCode.Accepted and popup.selected_color.isValid():
-            self.current_color = popup.selected_color
-            self._update_color_button()
-            if self.current_tool:
-                self.current_tool.color = self.current_color
-        self.activateWindow()
-        self.setFocus()
+        # Drop the overlay below normal level so the picker popup (and the
+        # native Apple Colors panel it can open) appear ABOVE it and stay
+        # clickable. Without this the picker opens hidden behind the
+        # full-screen overlay and nothing seems to happen.
+        self._set_overlay_level(0)
+        try:
+            popup = _ColorPickerPopup(self.current_color, self)
+            popup.setWindowModality(Qt.WindowModality.ApplicationModal)
+            if popup.exec() == QDialog.DialogCode.Accepted and popup.selected_color.isValid():
+                self.current_color = popup.selected_color
+                self._update_color_button()
+                if self.current_tool:
+                    self.current_tool.color = self.current_color
+        finally:
+            self._set_overlay_level(25)
+            self.activateWindow()
+            self.setFocus()
+            self.raise_()
+            self.update()
 
     def _on_tool_selected(self, button):
         tool_id = button.property("tool_id")
@@ -972,6 +1010,12 @@ class OverlayWindow(QWidget):
         painter.drawText(x, y, text)
 
     def _get_result_image(self) -> Image.Image:
+        # Commit any text still being edited so it lands in the output.
+        # Clicking the Copy/Save toolbar buttons doesn't pass through the
+        # canvas mousePress that normally finalizes text, so without this
+        # a lone text annotation would be silently dropped.
+        if self.text_editing:
+            self._finish_text_editing()
         if not self.selection_rect: return self.original_image
         rect = self.selection_rect
         dpr = self.capture_dpr

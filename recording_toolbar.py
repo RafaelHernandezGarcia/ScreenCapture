@@ -359,6 +359,13 @@ class RecordingToolbar(QWidget):
             self._cam_btn.setToolTip("Enable Webcam")
         self.webcam_toggled.emit(self._webcam_on)
 
+    def reset_webcam_button(self):
+        """Force the webcam button back to the off state (e.g. permission denied)."""
+        self._webcam_on = False
+        self._cam_btn.setChecked(False)
+        self._cam_btn.setIcon(self._cam_off_icon)
+        self._cam_btn.setToolTip("Enable Webcam")
+
     def _on_draw(self):
         self._draw_active = self._draw_btn.isChecked()
         self.draw_toggled.emit(self._draw_active)

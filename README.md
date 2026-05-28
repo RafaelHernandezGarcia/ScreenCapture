@@ -48,9 +48,14 @@ A lightweight, native screen capture and recording app for macOS and Windows. Th
 
 ## Project Structure
 
+> **Start here if you're new (or an AI agent): read [CLAUDE.md](CLAUDE.md)** —
+> it lists the non-obvious macOS pitfalls (menu-bar icon, permissions,
+> Ctrl/Cmd, dialog z-order) and how the app is actually launched.
+
 ```
 ScreenCapture/
-├── main.py                  # Entry point — tray app, hotkey listener, orchestrator
+├── CLAUDE.md                # ⭐ Fast-path dev notes + macOS gotchas (read first)
+├── main.py                  # Entry point — tray app, hotkey listener, orchestrator (Qt)
 ├── capture.py               # Low-level screen capture (mss)
 ├── overlay.py               # LightShot-style selection + annotation UI
 ├── tools.py                 # Drawing tools (arrow, rect, circle, line, pen, text)
@@ -59,16 +64,25 @@ ScreenCapture/
 ├── countdown.py             # 3-2-1 countdown overlay
 ├── webcam.py                # Circular PiP webcam capture
 ├── audio_helper.py          # Audio capture + processing (system + mic)
+├── platform_utils.py        # macOS permission checks + Settings links + NSWindow helpers
+├── mac_tray.py              # Native NSStatusItem helper (currently UNUSED; see CLAUDE.md)
+├── sc/                      # Partial pure-PyObjC rewrite (NOT the live app).
+│   ├── hotkey.py            #   Carbon global hotkey — USED by main.py on macOS
+│   ├── capture.py           #   CGWindowListCreateImage capture (diagnostics)
+│   ├── overlay.py tray.py   #   Native overlay/tray (screenshot-only; run via `python -m sc`)
+│   ├── permissions.py ...   #   permissions / paths / config / clipboard
 ├── sc_audio_helper.m        # Native ObjC helper source (ScreenCaptureKit, macOS only)
 ├── sc_audio_helper          # Compiled binary (macOS only; build from .m)
 ├── config.json              # Persistent settings (created on first run; see config.example.json)
 ├── config.example.json      # Example config
 ├── requirements.txt         # Python dependencies
 ├── .gitignore
-├── sync.sh                  # Sync source → app bundle (macOS)
+├── sync.sh                  # Sync source → app bundle (does NOT copy sc/ — see CLAUDE.md)
 ├── assets/
-│   ├── icon.png             # App icon
-│   ├── icon_tray.png        # Menu bar icon
+│   ├── icon.svg             # ⭐ Source of truth for the feather icon (render to PNGs)
+│   ├── icon.png             # App icon (rendered from svg)
+│   ├── icon_tray.png        # Menu bar icon (44px)
+│   ├── icon_tray@2x.png     # Menu bar icon (88px retina)
 │   └── icon.ico             # Windows icon
 ├── install.sh               # macOS installer
 ├── install.bat              # Windows installer
@@ -491,11 +505,39 @@ The cursor is composited as an overlay on each frame. Ensure the recording regio
 ### App doesn't appear in Dock
 By design. `LSUIElement = true` in `Info.plist` makes it a menu bar-only app. Look for the tray icon in the macOS menu bar (top-right).
 
+### ⭐ Menu-bar icon doesn't appear when I double-click the app (but the app is running)
+This is the #1 historical gotcha. When the `.app` is launched via Finder/`open`, its `Contents/MacOS/ScreenCapture` **bash launcher** `exec`s Python, and the resulting process doesn't attach to the GUI session properly — so `QSystemTrayIcon` reports itself visible but renders **nothing** (this also affected the PyInstaller build). Launched **directly from a shell or via a LaunchAgent**, the icon renders fine.
+
+**Fix in use:** a LaunchAgent (`~/Library/LaunchAgents/com.screencapture.app.plist`, `RunAtLoad=true`) runs Python directly in the user's session and auto-starts at login. Do **not** rely on double-clicking the bundle. Manage with:
+```bash
+launchctl bootstrap  gui/$(id -u) ~/Library/LaunchAgents/com.screencapture.app.plist
+launchctl kickstart -k gui/$(id -u)/com.screencapture.app   # restart after a code change
+launchctl bootout    gui/$(id -u)/com.screencapture.app     # stop/uninstall
+```
+The clean long-term fix is a **code-signed `.app` with a compiled (non-script) launcher**. See [CLAUDE.md](CLAUDE.md).
+
+### "python3 can run in the background" macOS notice
+Shown once by macOS when the LaunchAgent is first registered (it's a new login item). Harmless. It says "python3" rather than "ScreenCapture" because we run the Python runtime directly — a signed bundle would fix the label. Manage under System Settings → General → Login Items & Extensions.
+
+### ⌘C / ⌘S / ⌘Z do nothing in the capture overlay
+Qt swaps Ctrl/Cmd on macOS — Command arrives as `Qt.ControlModifier`. `overlay.py` now accepts both modifiers and sets `StrongFocus`. (Fixed 2026-05-28.)
+
+### Color picker (or any dialog) opens but I can't see it
+It was opening *behind* the full-screen overlay (window level 25). The overlay now drops to level 0 while a dialog is open and restores after. (Fixed 2026-05-28.)
+
+### A text annotation alone isn't in the saved screenshot
+In-progress text wasn't committed when clicking the toolbar Copy/Save buttons. `_get_result_image()` now finalizes text first. (Fixed 2026-05-28.)
+
 ---
 
 ## Known Issues / Remaining Work
 
-These are open issues as of 2026-03-17 that need further investigation:
+> Several issues below were addressed on **2026-05-28** (⌘-shortcuts, color-picker
+> z-order, lone-text save, camera-permission request flow, screen-recording
+> permission guard, menu-bar icon via LaunchAgent, feather icon). See
+> [CLAUDE.md](CLAUDE.md) for current state. The remaining open items:
+
+These were open issues as of 2026-03-17; some are now fixed (see note above):
 
 ### Windows
 - **System audio capture** — Not implemented. See [Windows Support](#windows-support) above for implementation options (WASAPI, loopback capture).

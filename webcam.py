@@ -21,38 +21,38 @@ DEFAULT_RADIUS = 80  # pixels (logical)
 
 
 def list_cameras(max_check=5):
-    """Detect available cameras by probing indices.
+    """Detect available cameras as (index, name) tuples.
 
-    Returns a list of (index, name) tuples for cameras that can be opened.
-    On macOS, tries AVFoundation names first; falls back to index labels.
+    On macOS we enumerate via AVFoundation, which lists devices WITHOUT
+    Camera permission and without opening them. Probing with OpenCV (the
+    old approach) silently fails when Camera permission hasn't been granted
+    yet — so it reported "no cameras" even though cameras exist. The actual
+    permission prompt happens later, when the webcam is turned on.
+
+    On other platforms we probe with OpenCV.
     """
-    cameras = []
-    names = {}
-
-    # Try AVFoundation for friendly names (macOS)
     if IS_MACOS:
         try:
             from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
             devices = AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo)
-            for i, dev in enumerate(devices):
-                names[i] = dev.localizedName()
+            cams = [(i, str(dev.localizedName())) for i, dev in enumerate(devices)]
+            if cams:
+                return cams
         except Exception:
             pass
+        # fall through to OpenCV probing if AVFoundation found nothing
 
-    # Probe with OpenCV to confirm which indices actually open
     import cv2
+    cameras = []
     for idx in range(max_check):
         cap = cv2.VideoCapture(idx)
         if cap.isOpened():
-            # Read one frame to confirm it's a real camera
             ret, _ = cap.read()
             cap.release()
             if ret:
-                name = names.get(idx, f"Camera {idx}")
-                cameras.append((idx, name))
+                cameras.append((idx, f"Camera {idx}"))
         else:
             cap.release()
-
     return cameras
 
 
