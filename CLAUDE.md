@@ -157,40 +157,57 @@ with `iconutil`.
 
 ## Building the app (the shipped artifact)
 
-The deliverable is a **PyInstaller onedir, ad-hoc-signed `.app`**:
+The deliverable is a **PyInstaller onedir `.app`, signed with a stable
+self-signed certificate** so TCC grants (Screen Recording / Camera) persist
+across rebuilds for FREE — no $99 Apple Developer account.
 
+### One-time: create the signing certificate (GUI; user must do this)
+Keychain Access → Certificate Assistant → **Create a Certificate…**
+- Name: **LocalAppDev**  ·  Identity Type: **Self-Signed Root**  ·  Type: **Code Signing**
+- Check "Let me override defaults", set validity to ~3650 days.
+- After creating: double-click it → Trust → **Code Signing: Always Trust**.
+
+Why this works: ad-hoc signing keys TCC to the per-build **cdhash** (changes
+every build → grant lost). A stable cert gives a constant **Authority**; TCC
+anchors the grant to (bundle id + cert), so it survives rebuilds.
+
+### Build + sign + install (one command)
 ```bash
-# 1. (re)generate the icns from the feather
-ICONSET=/tmp/sc.iconset; rm -rf "$ICONSET"; mkdir -p "$ICONSET"
-for s in 16 32 128 256 512; do sips -z $s $s assets/icon.png --out "$ICONSET/icon_${s}x${s}.png"; \
-  d=$((s*2)); sips -z $d $d assets/icon.png --out "$ICONSET/icon_${s}x${s}@2x.png"; done
-iconutil -c icns "$ICONSET" -o assets/icon.icns
-
-# 2. build (onedir — the spec uses EXE(exclude_binaries=True)+COLLECT+BUNDLE)
-rm -rf build dist
-.venv/bin/python -m PyInstaller ScreenCapture.spec --noconfirm --clean
-# PyInstaller ad-hoc signs the bundle automatically. Result: dist/ScreenCapture.app
-
-# 3. install (remove old copies first to avoid bundle-id conflicts)
-rm -rf ~/Applications/ScreenCapture.app
-cp -R dist/ScreenCapture.app ~/Applications/ScreenCapture.app
+./build.sh          # render icns -> PyInstaller onedir -> sign_app.sh -> install to ~/Applications
 ```
+Or the pieces: `pyinstaller ScreenCapture.spec --noconfirm --clean` then
+`./sign_app.sh dist/ScreenCapture.app`. Signing is **inside-out, never
+`--deep`** (signs every `.so`/`.dylib`, nested `.framework`s, the embedded
+python binary, the bootloader, then the outer `.app`) using
+`entitlements.plist` (camera/mic + `cs.disable-library-validation` so the
+cert-signed app can load wheel C-extensions; NO app-sandbox — it would block
+AVFoundation / CGWindowListCreateImage).
 
-Auto-start: add as a **Login Item** (`System Events make login item ...
+### First run (per machine, once)
+```bash
+tccutil reset ScreenCapture com.screencapture.app   # clear any stale ad-hoc entries
+tccutil reset Camera        com.screencapture.app
+open ~/Applications/ScreenCapture.app
+```
+Then grant Screen Recording + Camera once — it now shows as **ScreenCapture**
+(not python3.14) and the grant sticks across future `./build.sh` runs (same
+cert). The app also self-prompts (`_ensure_screen_recording` + webcam toggle).
+
+Auto-start: add as a **Login Item** (`System Events make login item …
 {path:".../ScreenCapture.app", hidden:true}`). Do NOT also run a LaunchAgent —
 pick one, or two instances fight over the F13 hotkey.
 
-**TCC after a rebuild:** ad-hoc signing means the cdhash changes each build, so
-macOS may require re-granting Screen Recording / Camera after a rebuild. A paid
-Developer ID cert (`codesign --sign "Developer ID Application: ..."`) would make
-grants survive rebuilds — not set up here. On first run the app fires the
-Screen Recording prompt (`_ensure_screen_recording`) and the Camera prompt (on
-webcam toggle), and deep-links to the right Settings pane.
-
-**Spec notes:** onedir is essential (onefile breaks stable identity). Keep
-`hiddenimports` in sync when adding modules that are imported inside function
-bodies (the `sc/` submodules, `mac_tray`, `platform_utils`, `cv2/av/mss`, the
-pyobjc frameworks). `sc_audio_helper` is bundled via `binaries`.
+### Notes / gotchas
+- **onedir is essential** (onefile unpacks to a random `/tmp` dir → TCC treats
+  it as a rogue path; also breaks the stable identity).
+- Run/install from `~/Applications`, never from `dist/` (Gatekeeper path
+  randomization muddies TCC).
+- If you only ever ad-hoc sign (skip the cert), grants reset every rebuild and
+  the Privacy list shows **python3.14** instead of ScreenCapture.
+- Keep `hiddenimports` in the spec in sync when adding dynamically-imported
+  modules (`sc/` submodules, `mac_tray`, `platform_utils`, `cv2/av/mss`, pyobjc
+  frameworks). `sc_audio_helper` is bundled via `binaries`.
+- Files: `build.sh` (pipeline), `sign_app.sh` (signing), `entitlements.plist`.
 
 ## Updating the installed app (dev iteration without a full rebuild)
 
@@ -220,9 +237,10 @@ LaunchAgent: `~/Library/LaunchAgents/com.screencapture.app.plist`. Manage with
 ---
 
 ## Known remaining work
-- **Signed `.app` bundle** with a compiled launcher: fixes (a) double-click
-  showing the icon, (b) camera/screen-recording grants attaching to a stable
-  "ScreenCapture" identity instead of "python3", (c) the rocket notification
-  icon and the "python3 can run in the background" label.
+- **Self-signed cert flow** (build.sh/sign_app.sh) is the free fix for stable
+  TCC identity + double-click icon + "ScreenCapture" label. Requires the
+  one-time `LocalAppDev` cert (see "Building the app"). A paid Developer ID +
+  notarization would additionally satisfy Gatekeeper for *distribution* — not
+  needed for personal use.
 - Windows system-audio capture (only mic today).
 - The `sc/` native rewrite is incomplete (no annotation/recording).
