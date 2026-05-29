@@ -166,19 +166,17 @@ class MicCapture:
         import sounddevice as sd
 
         # Open stream WITHOUT a callback — use blocking reads instead.
-        # latency='low' asks CoreAudio for the smallest safe input buffer, so
-        # captured voice is fresher (less delay vs. your lips). A smaller
-        # blocksize keeps reads tight.
+        # A roomy buffer + default ("high") latency is what keeps the audio
+        # CLEAN: too small a buffer drops samples on any hiccup and you hear
+        # the voice cut out. Any small lip-sync delay is handled by the
+        # "Audio Sync" offset, not by starving the buffer.
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=1,
             dtype='float32',
-            blocksize=512,
-            latency='low',
+            blocksize=2048,
         )
         self._stream.start()
-        # Record the device's reported input latency (seconds) so the
-        # recorder can shift the mic earlier to compensate for it.
         try:
             self.input_latency = float(self._stream.latency)
         except Exception:
@@ -194,7 +192,7 @@ class MicCapture:
         """Read audio blocks in a plain Python thread (no cffi callback)."""
         while self._running and self._stream:
             try:
-                data, overflowed = self._stream.read(512)
+                data, overflowed = self._stream.read(2048)
                 if self._paused or self._muted:
                     self._chunks.append(
                         np.zeros((len(data), 1), dtype=np.float32)

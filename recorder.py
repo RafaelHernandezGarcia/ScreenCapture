@@ -422,20 +422,11 @@ class ScreenRecorder(QThread):
                         except Exception:
                             pass
 
-                    # Composite webcam PiP
-                    with self._webcam_lock:
-                        webcam = self._webcam
-                        webcam_pos = self._webcam_pos
-                    if webcam and webcam_pos:
-                        try:
-                            cam_frame = webcam.get_latest_frame()
-                            if cam_frame is not None:
-                                _composite_webcam_circle(
-                                    frame, cam_frame,
-                                    webcam_pos[0], webcam_pos[1], webcam_pos[2]
-                                )
-                        except Exception:
-                            pass
+                    # NOTE: the webcam is NOT composited here. The on-screen
+                    # circular preview window is already part of the captured
+                    # framebuffer, so compositing again produced a SECOND,
+                    # offset circle. Capturing the live preview (WYSIWYG) gives
+                    # exactly one circle, right where the user placed it.
 
                     # Composite annotations
                     if self._annotation_overlay:
