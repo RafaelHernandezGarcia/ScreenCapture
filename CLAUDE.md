@@ -75,6 +75,16 @@ native helper `sc_audio_helper` (build from `sc_audio_helper.m`, see README).
 - TCC ties the grant to the binary identity. Running as bare `python3` means
   the grant attaches to the Python runtime, not "ScreenCapture".
 
+### Screenshot resolution (Retina quality)
+- `_do_capture` captures via **`sc.capture.grab` (CGWindowListCreateImage)**,
+  which grabs Retina displays at true **2x** (e.g. 2992×1934). **mss returned
+  only 1x** (1496×967) here — half resolution / soft when zoomed. mss is kept
+  as a fallback. The downstream `_get_result_image` already crops at
+  `logical × dpr`, so the saved PNG is full native resolution.
+- Saves are **lossless PNG**; clipboard copy is PNG too. Further refinement
+  (not done): embed the display's ICC / Display-P3 profile for exact color on
+  wide-gamut screens (captured pixels are currently untagged → assumed sRGB).
+
 ### ⌘C / ⌘S / ⌘Z don't fire in the overlay
 - **Cause:** Qt swaps Ctrl/Cmd on macOS — the **Command** key arrives as
   `Qt.ControlModifier`, not `MetaModifier`. `overlay.py` defines

@@ -609,11 +609,25 @@ class ScreenCaptureApp:
             if not screen:
                 screen = QGuiApplication.primaryScreen()
             
-            # 2. Get Geometry (Now guaranteed to be Physical Pixels due to os.environ fix)
+            # 2. Get Geometry (logical points)
             geo = screen.geometry()
-            
-            # 3. Capture region (mss returns physical pixels on Retina)
-            screenshot = capture_region(geo.x(), geo.y(), geo.width(), geo.height())
+
+            # 3. Capture at FULL native resolution. CGWindowListCreateImage
+            #    grabs Retina displays at true 2x (mss only returned 1x here,
+            #    i.e. half resolution). Fall back to mss if it ever fails.
+            screenshot = None
+            if IS_MACOS:
+                try:
+                    from sc.capture import grab as _cg_grab
+                    screenshot = _cg_grab({"x": geo.x(), "y": geo.y(),
+                                           "w": geo.width(), "h": geo.height()})
+                    if screenshot is None or screenshot.width < geo.width():
+                        screenshot = None  # bad grab -> fall back
+                except Exception as e:
+                    print(f"[capture] CG grab failed ({e}); using mss")
+                    screenshot = None
+            if screenshot is None:
+                screenshot = capture_region(geo.x(), geo.y(), geo.width(), geo.height())
 
             # 4. Compute capture DPR (physical pixels / logical pixels)
             capture_dpr = screenshot.width / geo.width() if geo.width() > 0 else 1.0
