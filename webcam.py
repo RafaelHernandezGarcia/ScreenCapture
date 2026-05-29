@@ -147,9 +147,10 @@ class WebcamPreviewWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(diameter + 6, diameter + 6)  # +6 for border
 
-        # Position at bottom-right of recording region
+        # Position at bottom-right of recording region (clamped inside it)
         x = recording_rect.right() - diameter - 20
         y = recording_rect.bottom() - diameter - 20
+        x, y = self._clamp_pos(x, y)
         self.move(x, y)
 
         # Circular mask
@@ -165,6 +166,16 @@ class WebcamPreviewWidget(QWidget):
         region = QRegion(0, 0, diameter, diameter, QRegion.RegionType.Ellipse)
         self.setMask(region)
 
+    def _clamp_pos(self, x, y):
+        """Keep the whole circle inside the recording region."""
+        r = self._recording_rect
+        w, h = self.width(), self.height()
+        max_x = r.left() + max(0, r.width() - w)
+        max_y = r.top() + max(0, r.height() - h)
+        x = min(max(int(x), r.left()), max_x)
+        y = min(max(int(y), r.top()), max_y)
+        return x, y
+
     def showEvent(self, event):
         super().showEvent(event)
         self._emit_position()
@@ -175,6 +186,18 @@ class WebcamPreviewWidget(QWidget):
     def _apply_nswindow(self):
         from recorder import _configure_nswindow
         _configure_nswindow(self, click_through=False, level=25)
+        # Drop the window shadow: a circular translucent window leaves a
+        # shadow "ghost" trailing behind it while you drag it on macOS.
+        try:
+            import ctypes as _ct
+            import objc
+            ptr = int(self.winId())
+            if ptr:
+                win = objc.objc_object(c_void_p=_ct.c_void_p(ptr)).window()
+                if win is not None:
+                    win.setHasShadow_(False)
+        except Exception:
+            pass
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -237,7 +260,9 @@ class WebcamPreviewWidget(QWidget):
 
     def mouseMoveEvent(self, event):
         if self._drag_pos is not None:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
+            target = event.globalPosition().toPoint() - self._drag_pos
+            x, y = self._clamp_pos(target.x(), target.y())  # stay inside region
+            self.move(x, y)
             self._emit_position()
 
     def mouseReleaseEvent(self, event):
