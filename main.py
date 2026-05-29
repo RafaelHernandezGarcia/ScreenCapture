@@ -612,17 +612,21 @@ class ScreenCaptureApp:
             # 2. Get Geometry (logical points)
             geo = screen.geometry()
 
-            # 3. Capture at FULL native resolution. CGWindowListCreateImage
-            #    grabs Retina displays at true 2x (mss only returned 1x here,
-            #    i.e. half resolution). Fall back to mss if it ever fails.
+            # 3. Capture the screen region.
+            #    Default = mss, which produces screenshots at the familiar
+            #    on-screen size. Retina displays have 2x the physical pixels;
+            #    capturing all of them (via CGWindowListCreateImage) makes the
+            #    image sharper BUT also 2x the pixel dimensions, so it opens
+            #    larger. Some users find that "zoomed". It's therefore opt-in
+            #    via config "high_res_screenshots": true.
             screenshot = None
-            if IS_MACOS:
+            if IS_MACOS and self.config.get("high_res_screenshots"):
                 try:
                     from sc.capture import grab as _cg_grab
                     screenshot = _cg_grab({"x": geo.x(), "y": geo.y(),
                                            "w": geo.width(), "h": geo.height()})
                     if screenshot is None or screenshot.width < geo.width():
-                        screenshot = None  # bad grab -> fall back
+                        screenshot = None
                 except Exception as e:
                     print(f"[capture] CG grab failed ({e}); using mss")
                     screenshot = None

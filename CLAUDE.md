@@ -76,14 +76,15 @@ native helper `sc_audio_helper` (build from `sc_audio_helper.m`, see README).
   the grant attaches to the Python runtime, not "ScreenCapture".
 
 ### Screenshot resolution (Retina quality)
-- `_do_capture` captures via **`sc.capture.grab` (CGWindowListCreateImage)**,
-  which grabs Retina displays at true **2x** (e.g. 2992×1934). **mss returned
-  only 1x** (1496×967) here — half resolution / soft when zoomed. mss is kept
-  as a fallback. The downstream `_get_result_image` already crops at
-  `logical × dpr`, so the saved PNG is full native resolution.
-- Saves are **lossless PNG**; clipboard copy is PNG too. Further refinement
-  (not done): embed the display's ICC / Display-P3 profile for exact color on
-  wide-gamut screens (captured pixels are currently untagged → assumed sRGB).
+- Default capture = **mss** → screenshots at the familiar on-screen size.
+- **Opt-in** `config["high_res_screenshots"] = true` switches `_do_capture` to
+  **`sc.capture.grab` (CGWindowListCreateImage)**, which grabs Retina displays
+  at true **2x** (e.g. 2992×1934 vs mss's 1496×967). It's sharper but the PNG
+  is 2x the pixel dimensions, so it opens larger — a user found that
+  "zoomed-in", hence it's off by default. Non-Retina (1080p) displays are 1x
+  either way, so the flag makes no difference there.
+- Saves are **lossless PNG**; clipboard copy is PNG too. Possible refinement:
+  embed the display's ICC / Display-P3 profile for exact wide-gamut color.
 
 ### ⌘C / ⌘S / ⌘Z don't fire in the overlay
 - **Cause:** Qt swaps Ctrl/Cmd on macOS — the **Command** key arrives as
