@@ -333,6 +333,9 @@ class ScreenCaptureApp:
         self._camera_menu = QMenu("Camera", menu)
         self._camera_menu.aboutToShow.connect(self._populate_camera_menu)
         menu.addMenu(self._camera_menu)
+        self._audio_sync_menu = QMenu("Audio Sync (lip-sync)", menu)
+        self._audio_sync_menu.aboutToShow.connect(self._populate_audio_sync_menu)
+        menu.addMenu(self._audio_sync_menu)
         open_recordings_action = QAction("Open Recordings Folder", menu)
         open_recordings_action.triggered.connect(self._open_recordings_folder)
         menu.addAction(open_recordings_action)
@@ -375,6 +378,39 @@ class ScreenCaptureApp:
                 lambda i=idx, n=name: self._select_camera(i, n),
                 checked=(idx == self._camera_index),
             )
+
+    def _populate_audio_sync_menu(self):
+        """Lip-sync offset chooser (like OBS's audio sync offset)."""
+        self._audio_sync_menu.clear()
+        current = int(self.config.get("audio_offset_ms", 0))
+        hint = QAction("If your voice LAGS your lips, pick 'earlier'", self._audio_sync_menu)
+        hint.setEnabled(False)
+        self._audio_sync_menu.addAction(hint)
+        self._audio_sync_menu.addSeparator()
+        # negative = advance the voice (fixes the common "audio is late" lag)
+        options = [
+            ("Voice much earlier  (−200 ms)", -200),
+            ("Voice earlier  (−120 ms)", -120),
+            ("Voice slightly earlier  (−60 ms)", -60),
+            ("In sync  (0 ms)", 0),
+            ("Voice slightly later  (+60 ms)", 60),
+            ("Voice later  (+120 ms)", 120),
+        ]
+        for label, ms in options:
+            act = QAction(label, self._audio_sync_menu)
+            act.setCheckable(True)
+            act.setChecked(ms == current)
+            act.triggered.connect(lambda checked, m=ms: self._set_audio_offset(m))
+            self._audio_sync_menu.addAction(act)
+
+    def _set_audio_offset(self, ms: int):
+        self.config["audio_offset_ms"] = int(ms)
+        save_config(self.config)
+        self.tray.showMessage(
+            "ScreenCapture",
+            f"Audio sync set to {ms:+d} ms — applies to your next recording.",
+            QSystemTrayIcon.MessageIcon.Information, 2500,
+        )
 
     def _set_stop_visible(self, visible: bool):
         """Show/hide the Stop Recording item in whichever menu is active."""
@@ -659,6 +695,7 @@ class ScreenCaptureApp:
             region, output_path,
             dpr=self._last_capture_dpr,
             logical_origin=logical_origin,
+            audio_offset_ms=self.config.get("audio_offset_ms", 0),
         )
         self._recorder.recording_stopped.connect(self._on_recording_stopped)
         self._recorder.recording_error.connect(self._on_recording_error)

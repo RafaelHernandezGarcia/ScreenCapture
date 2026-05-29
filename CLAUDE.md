@@ -132,8 +132,19 @@ native helper `sc_audio_helper` (build from `sc_audio_helper.m`, see README).
 webcam PiP, annotations → PyAV encodes H.264 into a temp **MKV** (the MP4 muxer
 hits errno 22 on macOS via PyAV) → ffmpeg remuxes to MP4 and muxes AAC audio.
 Audio: system audio via `sc_audio_helper` (ScreenCaptureKit), mic via
-`sounddevice`, mixed/mastered in `audio_helper.py`. Output →
-`~/Movies/ScreenCapture/`, revealed in Finder on stop.
+`sounddevice` (low-latency InputStream), mixed/mastered in `audio_helper.py`.
+Output → `~/Movies/ScreenCapture/`, revealed in Finder on stop.
+
+**A/V sync (lip-sync):** three independent clocks (mss video, SCK system audio,
+sounddevice mic) are aligned by start-time arithmetic. Two safeguards:
+- **`audio_offset_ms`** (config + tray "Audio Sync" submenu): OBS-style manual
+  sync offset. −ms advances the voice (fixes "voice lags lips"), +ms delays it.
+- **Anti-drift:** the mixed audio is padded/trimmed to exactly the video's
+  length (`last_pts/fps`) so the ends can't drift apart on long recordings.
+- **Ultimate fix (future):** capture video AND audio through ScreenCaptureKit
+  so every frame/sample shares ONE clock (what CleanShot/Loom/Screen Studio do)
+  → frame-accurate sync, no offset needed. `sc_audio_helper.m` already uses SCK
+  for audio; extending it to video is the real "copy the pros" rewrite.
 
 ---
 

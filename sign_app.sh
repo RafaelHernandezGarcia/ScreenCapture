@@ -3,70 +3,55 @@
 # macOS TCC anchors Screen Recording / Camera grants to the certificate
 # Authority (which survives rebuilds), instead of the per-build cdhash.
 #
-# Prereq (one-time, GUI): create a self-signed Code Signing certificate in
-# Keychain Access named exactly $CERT (default "LocalAppDev"), valid for years,
-# and set its Trust -> Code Signing to "Always Trust". See CLAUDE.md.
+# Prereq (one-time, GUI): a self-signed Code Signing certificate named exactly
+# $CERT (default "LocalAppDev") in the keychain, trusted for code signing.
+# See CLAUDE.md.
 #
 # Usage:  ./sign_app.sh [path/to/ScreenCapture.app]
-set -euo pipefail
+set -uo pipefail   # NOT -e: a single inner failure must not abort the loop
 
 CERT="${CERT:-LocalAppDev}"
 APP_PATH="${1:-dist/ScreenCapture.app}"
 ENTITLEMENTS="$(cd "$(dirname "$0")" && pwd)/entitlements.plist"
+MAIN_EXE="$APP_PATH/Contents/MacOS/ScreenCapture"
 
 if ! security find-identity -v -p codesigning | grep -q "$CERT"; then
-  echo "ERROR: code-signing identity '$CERT' not found in the keychain."
-  echo "Create it in Keychain Access (Certificate Assistant -> Create a"
-  echo "Certificate; Self-Signed Root; Code Signing) and set it to Always Trust."
+  echo "ERROR: code-signing identity '$CERT' not found / not trusted in the keychain."
   exit 1
 fi
 if [ ! -d "$APP_PATH" ]; then
-  echo "ERROR: app bundle not found at $APP_PATH (build it first: pyinstaller ScreenCapture.spec)"
+  echo "ERROR: app bundle not found at $APP_PATH (build it first)."
   exit 1
 fi
 
 echo "Signing $APP_PATH with identity '$CERT' (inside-out, no --deep)..."
 
-# 1. Strip any stale ad-hoc/broken signatures from inner files.
+# 1. Strip stale ad-hoc/broken signatures.
 find "$APP_PATH" -type f -print0 | xargs -0 codesign --remove-signature 2>/dev/null || true
 
-# 2. Sign every compiled extension / dylib first.
-find "$APP_PATH" -type f \( -name "*.so" -o -name "*.dylib" \) -print0 \
-  | while IFS= read -r -d '' f; do
-      codesign --force --timestamp=none --sign "$CERT" --options runtime "$f"
-    done
+# 2. Sign EVERY nested Mach-O binary (extensions, dylibs, and standalone
+#    executables like ffmpeg / sc_audio_helper / embedded python) — but NOT
+#    the bundle's own main executable (that gets signed by signing the .app).
+warns=0
+while IFS= read -r -d '' f; do
+  [ "$f" = "$MAIN_EXE" ] && continue
+  if file -b "$f" | grep -q "Mach-O"; then
+    codesign --force --timestamp=none --sign "$CERT" --options runtime "$f" 2>/dev/null \
+      || { echo "  warn: could not sign ${f#$APP_PATH/}"; warns=$((warns+1)); }
+  fi
+done < <(find "$APP_PATH" -type f -print0)
+[ "$warns" -gt 0 ] && echo "  ($warns inner files could not be signed)"
 
-# 3. Sign nested .framework bundles (PyQt6, Python core, etc.).
-if [ -d "$APP_PATH/Contents/Frameworks" ]; then
-  find "$APP_PATH/Contents/Frameworks" -type d -name "*.framework" -print0 \
-    | while IFS= read -r -d '' fw; do
-        codesign --force --timestamp=none --sign "$CERT" --options runtime "$fw"
-      done
-fi
-
-# 4. Sign any embedded python interpreter binaries (the TCC "responsible process").
-find "$APP_PATH/Contents" -type f -name "python*" -perm -111 -print0 2>/dev/null \
-  | while IFS= read -r -d '' py; do
-      codesign --force --timestamp=none --sign "$CERT" \
-        --entitlements "$ENTITLEMENTS" --options runtime "$py"
-    done
-
-# 5. Sign the main bootloader executable.
-codesign --force --timestamp=none --sign "$CERT" \
-  --entitlements "$ENTITLEMENTS" --options runtime \
-  "$APP_PATH/Contents/MacOS/ScreenCapture"
-
-# 6. Finally, sign the outer .app wrapper.
+# 3. Sign the .app bundle itself with entitlements. This signs the main
+#    executable (applying the entitlements) and seals the bundle.
 codesign --force --timestamp=none --sign "$CERT" \
   --entitlements "$ENTITLEMENTS" --options runtime "$APP_PATH"
 
 echo "--- verification ---"
-codesign --verify --deep --strict --verbose=2 "$APP_PATH" && echo "signature OK"
+if codesign --verify --deep --strict --verbose=2 "$APP_PATH"; then
+  echo "signature OK"
+else
+  echo "WARNING: verification reported issues (see above)"
+fi
 echo "--- authority / entitlements ---"
-codesign -dvvv "$APP_PATH" 2>&1 | grep -E "Identifier|Authority|TeamIdentifier" || true
-echo
-echo "Done. Move the app to ~/Applications, then (first time only):"
-echo "  tccutil reset ScreenCapture com.screencapture.app"
-echo "  tccutil reset Camera        com.screencapture.app"
-echo "Launch it, grant Screen Recording + Camera once — it should now show as"
-echo "'ScreenCapture' and the grant will persist across future rebuilds."
+codesign -dvv "$APP_PATH" 2>&1 | grep -E "Identifier|Authority" || true

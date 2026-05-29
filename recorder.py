@@ -226,13 +226,17 @@ class ScreenRecorder(QThread):
     recording_error = pyqtSignal(str)     # emits error message
 
     def __init__(self, region: dict, output_path: str, fps: int = 30,
-                 dpr: float = 1.0, logical_origin: tuple = (0, 0)):
+                 dpr: float = 1.0, logical_origin: tuple = (0, 0),
+                 audio_offset_ms: int = 0):
         super().__init__()
         self.region = dict(region)
         self.output_path = output_path
         self.fps = fps
         self.dpr = dpr
         self.logical_origin = logical_origin
+        # +ms delays audio (use if voice is ahead of lips); -ms advances audio
+        # (use if voice lags behind lips). The user-tunable "sync offset".
+        self.audio_offset_ms = int(audio_offset_ms)
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # Not paused initially
@@ -468,6 +472,32 @@ class ScreenRecorder(QThread):
                     mixed_stereo = remove_paused_segments(
                         mixed_stereo, self._pause_intervals, audio_sample_rate
                     )
+
+                # --- Lip-sync offset (user-tunable, like OBS "sync offset") ---
+                # +ms: delay audio (pad silence in front). -ms: advance audio
+                # (trim from front) — use this if your voice lags your lips.
+                offset_samples = int(self.audio_offset_ms / 1000.0 * audio_sample_rate)
+                if offset_samples > 0:
+                    mixed_stereo = np.concatenate(
+                        [np.zeros((offset_samples, 2), dtype=np.float32), mixed_stereo]
+                    )
+                elif offset_samples < 0:
+                    cut = min(-offset_samples, len(mixed_stereo))
+                    mixed_stereo = mixed_stereo[cut:]
+
+                # --- Anti-drift: force audio length == actual video length so
+                # the two can't drift apart over a long recording (ends stay
+                # locked). last_pts is in 1/fps units. ---
+                if last_pts >= 0:
+                    video_samples = int(((last_pts + 1) / self.fps) * audio_sample_rate)
+                    if video_samples > 0:
+                        if len(mixed_stereo) > video_samples:
+                            mixed_stereo = mixed_stereo[:video_samples]
+                        elif len(mixed_stereo) < video_samples:
+                            pad = video_samples - len(mixed_stereo)
+                            mixed_stereo = np.concatenate(
+                                [mixed_stereo, np.zeros((pad, 2), dtype=np.float32)]
+                            )
 
                 if len(mixed_stereo) > 0:
                     has_audio = True
