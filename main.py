@@ -751,6 +751,24 @@ class ScreenCaptureApp:
             print(f"[DEBUG] RecordingToolbar FAILED: {e}")
             import traceback; traceback.print_exc()
 
+        # If the webcam was on last time, bring the circle up automatically so
+        # it's there from the start — no mid-recording click + wait.
+        if self.config.get("webcam_default"):
+            authorized = True
+            if IS_MACOS:
+                try:
+                    from platform_utils import camera_permission_status
+                    authorized = camera_permission_status() == "authorized"
+                except Exception:
+                    authorized = True
+            if authorized:
+                try:
+                    self._start_webcam()
+                    if self._toolbar:
+                        self._toolbar.set_webcam_on()
+                except Exception as e:
+                    print(f"[webcam] auto-start failed: {e}")
+
         self._is_recording = True
         self._set_stop_visible(True)
         self._recorder.start()
@@ -771,6 +789,10 @@ class ScreenCaptureApp:
             self._recorder.set_mic_muted(muted)
 
     def _on_webcam_toggled(self, on: bool):
+        # Remember the choice so the next recording starts with the webcam
+        # already showing (no clicking + waiting mid-recording).
+        self.config["webcam_default"] = bool(on)
+        save_config(self.config)
         if on:
             # Camera needs explicit TCC permission. OpenCV is told to skip
             # its own auth request (OPENCV_AVFOUNDATION_SKIP_AUTH), so we

@@ -371,6 +371,31 @@ class ScreenRecorder(QThread):
             stream.pix_fmt = 'yuv420p'
             stream.options = {'preset': 'ultrafast', 'crf': '23'}
 
+            # --- Encoder on its own thread so a slow encode never stalls frame
+            #     capture (smoother video). The capture loop only grabs +
+            #     composites + queues; this worker encodes + muxes. PyAV's
+            #     stream/container are touched ONLY here. ---
+            import queue as _queue
+            frame_q = _queue.Queue(maxsize=max(8, self.fps * 3))
+            _enc_err = {}
+
+            def _encode_worker():
+                try:
+                    while True:
+                        vf = frame_q.get()
+                        if vf is None:
+                            break
+                        for packet in stream.encode(vf):
+                            container.mux(packet)
+                    for packet in stream.encode():   # flush
+                        container.mux(packet)
+                except Exception as e:
+                    _enc_err["e"] = e
+
+            enc_thread = threading.Thread(target=_encode_worker, daemon=True,
+                                          name="sc-encoder")
+            enc_thread.start()
+
             # Clock starts when we begin capturing frames — trim audio lead to match
             self._recording_start = time.perf_counter()
             last_pts = -1  # Ensure strictly increasing PTS (duplicates cause mux errno 22)
@@ -427,21 +452,33 @@ class ScreenRecorder(QThread):
                                       - self._recording_start
                                       - self._total_pause_duration)
                     target_pts = int(active_elapsed * self.fps)
-                    video_frame.pts = max(last_pts + 1, target_pts)
-                    last_pts = video_frame.pts
+                    pts = max(last_pts + 1, target_pts)
+                    video_frame.pts = pts
 
-                    for packet in stream.encode(video_frame):
-                        container.mux(packet)
+                    # Hand off to the encoder thread. The queue absorbs short
+                    # encode bursts; if it's momentarily full, drop this frame
+                    # (playback just holds the previous one) rather than stall
+                    # capture — which keeps motion smooth.
+                    try:
+                        frame_q.put_nowait(video_frame)
+                        last_pts = pts
+                    except _queue.Full:
+                        pass
+
+                    if _enc_err:
+                        raise _enc_err["e"]
 
                     elapsed = time.perf_counter() - t0
                     sleep_time = frame_interval - elapsed
                     if sleep_time > 0:
                         time.sleep(sleep_time)
 
-            # Flush video encoder
-            for packet in stream.encode():
-                container.mux(packet)
+            # Signal the encoder to flush + finish, then close the container.
+            frame_q.put(None)
+            enc_thread.join(timeout=30)
             container.close()
+            if _enc_err:
+                raise _enc_err["e"]
 
             # --- Stop audio ---
             if sys_capture:

@@ -366,6 +366,13 @@ class RecordingToolbar(QWidget):
         self._cam_btn.setIcon(self._cam_off_icon)
         self._cam_btn.setToolTip("Enable Webcam")
 
+    def set_webcam_on(self):
+        """Reflect the webcam being auto-enabled at recording start."""
+        self._webcam_on = True
+        self._cam_btn.setChecked(True)
+        self._cam_btn.setIcon(self._cam_on_icon)
+        self._cam_btn.setToolTip("Disable Webcam")
+
     def _on_draw(self):
         self._draw_active = self._draw_btn.isChecked()
         self.draw_toggled.emit(self._draw_active)

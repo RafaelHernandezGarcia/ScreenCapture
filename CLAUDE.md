@@ -146,6 +146,21 @@ Audio: system audio via `sc_audio_helper` (ScreenCaptureKit), mic via
 `sounddevice` (low-latency InputStream), mixed/mastered in `audio_helper.py`.
 Output → `~/Movies/ScreenCapture/`, revealed in Finder on stop.
 
+**Smoothness:** the capture loop only grabs + composites + queues frames; a
+separate **encoder thread** does `stream.encode`/`container.mux` (PyAV touched
+only there). A bounded `queue.Queue` absorbs encode bursts so a slow encode
+can't stall capture (less stutter); if the queue is momentarily full the frame
+is dropped (playback holds the previous one).
+
+**Audio mix:** `mix_and_master` applies **sidechain ducking** — system audio
+plays full when you're silent and drops ~14 dB when the mic detects voice
+(per-5ms RMS detector + attack/release), so narration stays on top. Voice is
+mixed 1.4×. (Loom/ScreenFlow do the same.)
+
+**Webcam:** the last on/off choice is saved (`config["webcam_default"]`); if it
+was on, `_start_recording` auto-enables the circle from the start (no clicking
+mid-recording). `_start_webcam` reuses an existing capture if present.
+
 **A/V sync (lip-sync):** three independent clocks (mss video, SCK system audio,
 sounddevice mic) are aligned by start-time arithmetic. Two safeguards:
 - **`audio_offset_ms`** (config + tray "Audio Sync" submenu): OBS-style manual

@@ -288,47 +288,82 @@ def peak_normalize(audio, target_db=-1.0):
     return audio * (target / peak)
 
 
+def _ducking_gain(mic_mono, sample_rate, duck_db=-14.0,
+                  threshold_db=-38.0, attack_ms=12.0, release_ms=320.0):
+    """Sidechain ducking gain for the SYSTEM audio (0..1 per sample).
+
+    Drops the system audio when the mic has voice so narration cuts through,
+    and smoothly returns to full when you stop talking — exactly what
+    Loom / ScreenFlow / OBS (sidechain compressor) do. Computed per 5 ms
+    block for speed, then upsampled to the audio rate.
+    """
+    n = len(mic_mono)
+    if n == 0:
+        return None
+    block = max(1, int(sample_rate * 0.005))          # 5 ms
+    thresh = 10 ** (threshold_db / 20.0)
+    duck = 10 ** (duck_db / 20.0)                      # e.g. -14 dB -> 0.20
+    nblocks = (n + block - 1) // block
+    # per-block RMS of the mic (voice detector)
+    pad = nblocks * block - n
+    mic_p = np.concatenate([mic_mono, np.zeros(pad, dtype=np.float32)]) if pad else mic_mono
+    rms = np.sqrt(np.mean(mic_p.reshape(nblocks, block) ** 2, axis=1) + 1e-12)
+    # attack/release one-pole smoothing on the gain
+    a_atk = np.exp(-1.0 / (sample_rate * (attack_ms / 1000.0) / block))
+    a_rel = np.exp(-1.0 / (sample_rate * (release_ms / 1000.0) / block))
+    gain = np.ones(nblocks, dtype=np.float32)
+    g = 1.0
+    for i in range(nblocks):
+        target = duck if rms[i] > thresh else 1.0
+        coeff = a_atk if target < g else a_rel       # fast to duck, slow to release
+        g = coeff * g + (1.0 - coeff) * target
+        gain[i] = g
+    return np.repeat(gain, block)[:n]
+
+
 def mix_and_master(system_stereo, mic_mono, sample_rate=SAMPLE_RATE):
     """Professional mix of system audio + mic into stereo output.
 
-    Processing chain:
-      1. Mic: noise gate -> compression (NO per-mic peak-normalize:
-         a single loud transient would squash the entire voice track)
-      2. System: pass-through (already clean from ScreenCaptureKit)
-      3. Mix: system at 1.0 + mic at 1.2 -> center
-      4. Final: limiter at -1 dB -> peak normalize to -0.5 dB
+    Chain: mic gate+compress -> SIDECHAIN-DUCK the system under the voice ->
+    mix (voice forward) -> limiter -> peak normalize. The ducking is what
+    keeps your voice clearly on top of music / video audio.
     Returns: float32 numpy array shaped (N, 2)
     """
-    # Process mic — gate and compress only (no peak_normalize!)
+    # Process mic — gate and compress (no peak_normalize: one transient
+    # would squash the whole voice track)
     if len(mic_mono) > 0:
         mic_mono = noise_gate(mic_mono, threshold_db=-50, hold_ms=200,
                               sample_rate=sample_rate)
         mic_mono = soft_compress(mic_mono, threshold_db=-24, ratio=2.5,
                                  makeup_db=12)
 
-    # Determine output length
     sys_frames = len(system_stereo)
     mic_frames = len(mic_mono)
     out_frames = max(sys_frames, mic_frames)
-
     if out_frames == 0:
         return np.zeros((0, 2), dtype=np.float32)
 
     out = np.zeros((out_frames, 2), dtype=np.float32)
 
-    # System audio at full volume
+    # System audio, ducked under the voice so narration stays on top.
     if sys_frames > 0:
-        out[:sys_frames] += system_stereo[:sys_frames]
+        sysmix = system_stereo[:sys_frames].astype(np.float32).copy()
+        duck = _ducking_gain(mic_mono, sample_rate) if mic_frames > 0 else None
+        if duck is not None:
+            g = duck[:sys_frames]
+            if len(g) < sys_frames:  # mic shorter -> full volume after it ends
+                g = np.concatenate([g, np.ones(sys_frames - len(g), dtype=np.float32)])
+            sysmix *= g[:, None]
+        out[:sys_frames] += sysmix
 
-    # Mic louder in the mix — 1.2x to ensure voice cuts through
+    # Voice — forward in the mix (1.4x) on top of the ducked system audio.
     if mic_frames > 0:
-        out[:mic_frames, 0] += mic_mono[:mic_frames] * 1.2
-        out[:mic_frames, 1] += mic_mono[:mic_frames] * 1.2
+        v = mic_mono[:mic_frames] * 1.4
+        out[:mic_frames, 0] += v
+        out[:mic_frames, 1] += v
 
-    # Limiter then normalize
     out = _limiter_stereo(out, threshold_db=-1.0)
     out = _normalize_stereo(out, target_db=-0.5)
-
     return out
 
 
