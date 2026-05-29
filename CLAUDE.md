@@ -152,10 +152,17 @@ only there). A bounded `queue.Queue` absorbs encode bursts so a slow encode
 can't stall capture (less stutter); if the queue is momentarily full the frame
 is dropped (playback holds the previous one).
 
-**Audio mix:** `mix_and_master` applies **sidechain ducking** — system audio
-plays full when you're silent and drops ~14 dB when the mic detects voice
-(per-5ms RMS detector + attack/release), so narration stays on top. Voice is
-mixed 1.4×. (Loom/ScreenFlow do the same.)
+**Audio mix (`mix_and_master`) — deliberately simple / Loom-style, for CLEAN
+audio. Do NOT re-add fancy dynamics here; they each caused a real complaint:**
+- NO sidechain ducking → dynamic ducking audibly *pumps* the volume up/down.
+- NO hard noise gate → it clips quiet word-endings (audio "cuts").
+- NO tiny mic buffer → a small `InputStream` blocksize starves on hiccups and
+  drops samples (audio "cuts"). Mic uses a roomy 2048-sample buffer.
+- The mix is: gentle mic compression (consistent voice, no gate) + system
+  audio held at a **fixed 0.45 level** (steady background, no pumping) + voice
+  forward + peak limiter + ONE static normalize (loudness, not dynamic).
+- Lip-sync delay from the roomy buffer is handled by the "Audio Sync" offset,
+  never by shrinking the buffer.
 
 **Webcam:** the last on/off choice is saved (`config["webcam_default"]`); if it
 was on, `_start_recording` auto-enables the circle from the start (no clicking

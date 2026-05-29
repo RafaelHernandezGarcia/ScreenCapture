@@ -320,20 +320,21 @@ def _ducking_gain(mic_mono, sample_rate, duck_db=-14.0,
 
 
 def mix_and_master(system_stereo, mic_mono, sample_rate=SAMPLE_RATE):
-    """Professional mix of system audio + mic into stereo output.
+    """Clean, Loom-style mix: voice forward over a steady-level background.
 
-    Chain: mic gate+compress -> SIDECHAIN-DUCK the system under the voice ->
-    mix (voice forward) -> limiter -> peak normalize. The ducking is what
-    keeps your voice clearly on top of music / video audio.
+    Deliberately simple — what keeps it clean:
+      - NO sidechain ducking (dynamic ducking pumps the volume up/down).
+      - NO hard noise gate (it clips quiet word-endings -> "cuts").
+      - Just: gentle mic compression for a consistent voice level, the system
+        audio held at a fixed lower level (background), a peak limiter, and a
+        single overall normalize (one static gain, so no level pumping).
     Returns: float32 numpy array shaped (N, 2)
     """
-    # Process mic — gate and compress (no peak_normalize: one transient
-    # would squash the whole voice track)
+    SYSTEM_LEVEL = 0.45   # system audio sits steadily under the voice
     if len(mic_mono) > 0:
-        mic_mono = noise_gate(mic_mono, threshold_db=-50, hold_ms=200,
-                              sample_rate=sample_rate)
-        mic_mono = soft_compress(mic_mono, threshold_db=-24, ratio=2.5,
-                                 makeup_db=12)
+        # Gentle compression evens out the voice without gating it.
+        mic_mono = soft_compress(mic_mono, threshold_db=-24, ratio=3.0,
+                                 makeup_db=10)
 
     sys_frames = len(system_stereo)
     mic_frames = len(mic_mono)
@@ -342,26 +343,15 @@ def mix_and_master(system_stereo, mic_mono, sample_rate=SAMPLE_RATE):
         return np.zeros((0, 2), dtype=np.float32)
 
     out = np.zeros((out_frames, 2), dtype=np.float32)
-
-    # System audio, ducked under the voice so narration stays on top.
     if sys_frames > 0:
-        sysmix = system_stereo[:sys_frames].astype(np.float32).copy()
-        duck = _ducking_gain(mic_mono, sample_rate) if mic_frames > 0 else None
-        if duck is not None:
-            g = duck[:sys_frames]
-            if len(g) < sys_frames:  # mic shorter -> full volume after it ends
-                g = np.concatenate([g, np.ones(sys_frames - len(g), dtype=np.float32)])
-            sysmix *= g[:, None]
-        out[:sys_frames] += sysmix
-
-    # Voice — forward in the mix (1.4x) on top of the ducked system audio.
+        out[:sys_frames] += system_stereo[:sys_frames] * SYSTEM_LEVEL
     if mic_frames > 0:
-        v = mic_mono[:mic_frames] * 1.4
-        out[:mic_frames, 0] += v
-        out[:mic_frames, 1] += v
+        out[:mic_frames, 0] += mic_mono[:mic_frames]
+        out[:mic_frames, 1] += mic_mono[:mic_frames]
 
+    # Peak limiter (catch clipping) + one static normalize (loudness, no pump).
     out = _limiter_stereo(out, threshold_db=-1.0)
-    out = _normalize_stereo(out, target_db=-0.5)
+    out = _normalize_stereo(out, target_db=-1.0)
     return out
 
 
