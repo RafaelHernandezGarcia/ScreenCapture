@@ -14,10 +14,13 @@ class CountdownOverlay(QWidget):
 
     countdown_finished = pyqtSignal()
 
-    def __init__(self, screen_geo: QRect):
+    def __init__(self, screen_geo: QRect, region_rect: QRect = None):
         super().__init__()
         self._count = 3
         self._screen_geo = screen_geo
+        # The number is centered on the selected recording region (if given),
+        # not the whole screen — it should sit over what you're recording.
+        self._region_rect = region_rect
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -60,9 +63,14 @@ class CountdownOverlay(QWidget):
         # Semi-transparent background
         p.fillRect(self.rect(), QColor(0, 0, 0, 80))
 
-        # Dark circle in center
-        cx = self.width() // 2
-        cy = self.height() // 2
+        # Center on the selected region (mapped into widget-local coords),
+        # falling back to the screen center if no region was provided.
+        if self._region_rect is not None:
+            cx = self._region_rect.center().x() - self._screen_geo.x()
+            cy = self._region_rect.center().y() - self._screen_geo.y()
+        else:
+            cx = self.width() // 2
+            cy = self.height() // 2
         radius = 80
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(0, 0, 0, 180))

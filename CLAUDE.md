@@ -122,6 +122,42 @@ native helper `sc_audio_helper` (build from `sc_audio_helper.m`, see README).
   stable app identity (signed bundle); under bare-Python it can read
   `not_determined`.
 
+### Webcam looks laggy / jaggy even with a good camera
+- **Root cause #1 — capture mode.** `cv2.VideoCapture(index)` with NO config
+  opens the camera in its *default* mode, which is usually its **highest native
+  resolution** (1080p/4K on a good cam) at a sluggish delivered rate → choppy
+  motion. The better the camera, the worse it gets. Google Meet / WhatsApp are
+  smooth because they negotiate **720p @ 30fps with a shallow buffer**. So
+  `WebcamCapture._open_and_configure` now sets `CAP_PROP_FRAME_WIDTH/HEIGHT`
+  (1280×720), `CAP_PROP_FPS` (30) and `CAP_PROP_BUFFERSIZE=1` (return the
+  freshest frame, low latency). 720p is plenty for the small circular PiP.
+  The capture loop just `read()`s in a tight loop — `read()` blocks until the
+  next sensor frame, so it self-paces to ~30fps; the old artificial `sleep`
+  only added latency.
+- **Root cause #2 — preview repaint beating.** The live circle used a fixed
+  33ms `QTimer` to repaint, running independently of the camera's 30fps → the
+  two rates *beat*, repeating/skipping frames → visible judder in the **live
+  self-view** (the recording itself was fine). Fix: `WebcamCapture` emits a
+  `frame_ready` signal and `WebcamPreviewWidget` repaints on *that* (event
+  driven). The timer is kept only as a slow 200ms fallback.
+- The webcam appears in the recording by being **screen-captured** (the live
+  preview circle is part of the framebuffer mss grabs), NOT composited from the
+  camera feed — that's deliberate (compositing too gave a SECOND offset circle).
+  So webcam smoothness depends on the preview being smooth, which the two fixes
+  above ensure. mss grab is fast (~17ms for a large region → ~59fps ceiling), so
+  the screen-capture side is not the bottleneck.
+
+### Frameless overlay lands ~20px too high (pre-show `move()` drifts on macOS)
+- **Symptom:** the webcam circle tucked into the bottom-right looked even on the
+  right but had a big gap at the bottom — not symmetric.
+- **Cause:** a `move(x, y)` issued **before the native window is shown** drifts
+  upward ~20px on macOS (Qt later reports the window ~20px above where you asked;
+  confirmed by reading the live `NSWindow.frame()`). x was fine, y lost ~20px.
+- **Fix:** stash the target as `self._target_pos` and **re-assert it in
+  `_apply_nswindow`** (the `singleShot(0)` after `showEvent`), once the native
+  window exists — there `move()` sticks exactly. See `WebcamPreviewWidget`.
+  Any frameless overlay that must land pixel-precise should do the same.
+
 ### Overlays revealing the desktop / switching Spaces
 - Any overlay shown during capture/recording must be created with
   `WA_ShowWithoutActivating` and have its NSWindow set to
@@ -164,20 +200,56 @@ audio. Do NOT re-add fancy dynamics here; they each caused a real complaint:**
 - Lip-sync delay from the roomy buffer is handled by the "Audio Sync" offset,
   never by shrinking the buffer.
 
+**Recording size:** `config["recording_size"]` (`native`/`1080p`/`720p`, tray
+"Recording Size" menu) → `ScreenRecorder(target_height=...)`. Each frame is
+scaled to that height (aspect preserved, even dims via cv2) before encoding;
+`native` keeps the captured selection size. Capture itself stays mss/1x, so
+1080p of a sub-1080p area upscales — fine for a standard output size.
+
 **Webcam:** the last on/off choice is saved (`config["webcam_default"]`); if it
 was on, `_start_recording` auto-enables the circle from the start (no clicking
 mid-recording). `_start_webcam` reuses an existing capture if present.
 
-**A/V sync (lip-sync):** three independent clocks (mss video, SCK system audio,
-sounddevice mic) are aligned by start-time arithmetic. Two safeguards:
-- **`audio_offset_ms`** (config + tray "Audio Sync" submenu): OBS-style manual
-  sync offset. −ms advances the voice (fixes "voice lags lips"), +ms delays it.
+**A/V sync (lip-sync) — automatic, NO manual offset menu.** The old "Audio
+Sync" tray submenu / `audio_offset_ms` was removed (the user wanted it to "just
+be in sync"). Three independent clocks (mss video, SCK system audio, sounddevice
+mic) are aligned automatically:
+- **Per-source start-time alignment** (`_align` in `recorder.run`): each source
+  records its real `time.perf_counter()` start; we trim its lead-in (or pad with
+  silence) to line it up with the video's start. No human tuning.
+- **`webcam_latency_ms`** (passed to `ScreenRecorder`, default 160 when the
+  webcam is on): delays the audio so the voice lands on the (pipeline-delayed)
+  on-screen lips. NOTE: the webcam-capture fixes above (shallow buffer, no
+  artificial sleep) *reduced* the webcam's latency, so this 160 may now be a
+  touch high — recalibrate from user feedback (voice **before** lips → lower it;
+  **after** → raise it). It is NOT a user-facing setting.
 - **Anti-drift:** the mixed audio is padded/trimmed to exactly the video's
   length (`last_pts/fps`) so the ends can't drift apart on long recordings.
 - **Ultimate fix (future):** capture video AND audio through ScreenCaptureKit
   so every frame/sample shares ONE clock (what CleanShot/Loom/Screen Studio do)
   → frame-accurate sync, no offset needed. `sc_audio_helper.m` already uses SCK
   for audio; extending it to video is the real "copy the pros" rewrite.
+
+**Recording UI flow & feel (Loom/cal.com-grade — these were explicit asks):**
+- **Setup phase:** pick region → `SetupPanel` (white card: toggle cam/mic, drag
+  the circle) → "Start recording" → `CountdownOverlay` (3-2-1) → record.
+- **Countdown** dims the whole screen but centers the number on the **selected
+  region** (`CountdownOverlay(screen_geo, region_rect=...)`), not the screen.
+- **Stop must feel INSTANT.** Finalizing (encoder flush → audio mix → ffmpeg
+  remux) takes ~1s, so `_stop_recording` **hides every overlay immediately**
+  (not close — destroy happens later in `_cleanup_recording` when
+  `recording_stopped` fires) and lets the recorder finalize on its thread. Don't
+  reintroduce "wait for the file before clearing the UI" — it reads as lag.
+- **Drag handle is a SEPARATE top-level window.** `RecordingFrame._handle`
+  (the three red dots) is its own window, so hiding the frame doesn't hide it →
+  it lingered after Stop. `RecordingFrame.hideEvent` now hides the handle in
+  lockstep. Anything that hides/shows the frame must keep the handle paired.
+- **Stop button** is `recording_toolbar.StopButton` — a hand-painted raised red
+  pill (gradient + top sheen at rest, brighter fill + white ring on hover, a
+  real "sink" on press). Painted, not stylesheet, because stylesheet hover gave
+  too-weak contrast and no press affordance. `QLinearGradient` needs **float**
+  coords / `QPointF` (passing `QRect.topLeft()` → `QPoint` raised TypeError and
+  crashed the first paint = record start).
 
 ---
 
@@ -255,10 +327,24 @@ pick one, or two instances fight over the F13 hotkey.
 
 ## Updating the installed app (dev iteration without a full rebuild)
 
-For quick dev iteration you can still run from source (`/.venv/bin/python
-main.py` from a shell) — the icon shows when launched from a shell. To update
-the **shipped** app you must rebuild (above); the signed `.app` does not read
-your source tree.
+**Current dev setup (what's actually running):** a LaunchAgent runs
+`~/Documents/ScreenCapture/.venv/bin/python3 main.py` **directly from this
+repo** (RunAtLoad), so editing the source here IS editing the running app. To
+reload after a change:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.screencapture.app   # restart in place
+tail -f /tmp/sc_agent.log                                   # stdout/stderr + tracebacks
+```
+
+The menu-bar icon renders because the LaunchAgent launches python in the GUI
+session (a double-clicked bash-script `.app` does not — see the icon gotcha).
+`.pyc` caches under `__pycache__/` may be owned by the agent's user context, so
+syntax-check edits with `python -B -c "import ast; ast.parse(open('f.py').read())"`
+rather than `py_compile` (which tries to write the cache).
+
+To update the **shipped** signed `.app` instead, you must rebuild (above); the
+signed `.app` does not read your source tree.
 
 ## (legacy) source-copy install + LaunchAgent
 
@@ -286,5 +372,30 @@ LaunchAgent: `~/Library/LaunchAgents/com.screencapture.app.plist`. Manage with
   one-time `LocalAppDev` cert (see "Building the app"). A paid Developer ID +
   notarization would additionally satisfy Gatekeeper for *distribution* — not
   needed for personal use.
-- Windows system-audio capture (only mic today).
+- **Lip-sync calibration:** revisit `webcam_latency_ms` (default 160) now that
+  the webcam capture is lower-latency — tune from user feedback.
 - The `sc/` native rewrite is incomplete (no annotation/recording).
+
+### Cross-platform: making this run on Windows too (a wanted future goal)
+The architecture is already mostly portable; the platform-specific bits are
+isolated. What a Windows pass needs:
+- **Permissions/TCC:** macOS-only. `platform_utils` already branches; Windows
+  has no Screen Recording/Camera consent gate, so those checks no-op.
+- **Window/overlay config:** `_configure_nswindow` / `_configure_clickable_panel`
+  / `setHasShadow_` / NSWindow levels are AppKit. `RecordingAnnotationOverlay`
+  already has a Windows click-through branch (`WS_EX_TRANSPARENT` via ctypes);
+  the other overlays (webcam, toolbar, countdown, frame) need equivalent
+  always-on-top / non-activating handling on Windows (or just rely on
+  `WindowStaysOnTopHint`, which mostly works).
+- **The ~20px pre-show `move()` drift is macOS-only** — don't port the
+  re-assert hack blindly; verify Windows placement separately.
+- **Capture:** mss is cross-platform (Windows already 1x). The webcam
+  `cv2.VideoCapture` config (720p30, buffersize=1) is portable (DSHOW/MSMF
+  backends honor it).
+- **System audio:** macOS uses `sc_audio_helper` (ScreenCaptureKit). Windows
+  has only mic today; system audio needs WASAPI loopback (e.g. `soundcard`
+  loopback or a small native helper). Mic via `sounddevice` is cross-platform.
+- **Hotkey:** macOS uses `sc/hotkey.py` (Carbon). Windows needs a `RegisterHotKey`
+  equivalent.
+- **Packaging:** PyInstaller is cross-platform; the signing flow is macOS-only.
+- Output dir already branches (`~/Movies` vs `~/Videos`).

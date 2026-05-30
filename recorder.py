@@ -69,6 +69,58 @@ def _configure_nswindow(widget, click_through=False, level=25):
     except Exception as e:
         print(f"_configure_nswindow: {e}")
 
+
+def _configure_clickable_panel(widget, level=25):
+    """Make an overlay's buttons respond on the FIRST hover/click WITHOUT
+    activating the app (no two-click 'focus-then-click').
+
+    The control bar is a background window; by default macOS treats the first
+    click on an inactive window as 'just bring it forward' and delivers no
+    hover. Turning it into a non-activating floating NSPanel that 'becomes key
+    only if needed' + accepts mouse-moved events fixes both: hover highlights
+    and the first click presses the button, and focus stays on whatever you're
+    recording. No-op on non-macOS.
+    """
+    if not IS_MACOS:
+        return
+    try:
+        import ctypes as _ct
+        import objc
+        from AppKit import (
+            NSWindowStyleMaskNonactivatingPanel,
+            NSWindowCollectionBehaviorCanJoinAllSpaces,
+            NSWindowCollectionBehaviorStationary,
+            NSWindowCollectionBehaviorFullScreenAuxiliary,
+        )
+        ptr = int(widget.winId())
+        if ptr == 0:
+            return
+        win = objc.objc_object(c_void_p=_ct.c_void_p(ptr)).window()
+        if win is None:
+            return
+        # NSPanel-only knobs (Qt.Tool windows are NSPanels) — guarded.
+        try:
+            win.setStyleMask_(int(win.styleMask()) | NSWindowStyleMaskNonactivatingPanel)
+        except Exception:
+            pass
+        for sel, arg in (("setBecomesKeyOnlyIfNeeded_", True),
+                         ("setFloatingPanel_", True)):
+            try:
+                getattr(win, sel)(arg)
+            except Exception:
+                pass
+        win.setAcceptsMouseMovedEvents_(True)
+        win.setIgnoresMouseEvents_(False)
+        win.setLevel_(level)
+        win.setHidesOnDeactivate_(False)
+        win.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+    except Exception as e:
+        print(f"_configure_clickable_panel: {e}")
+
 # Arrow cursor bitmap: 0=transparent, 1=black outline, 2=white fill
 _CURSOR_BITMAP = np.array([
     [1,0,0,0,0,0,0,0,0,0,0],
@@ -227,16 +279,22 @@ class ScreenRecorder(QThread):
 
     def __init__(self, region: dict, output_path: str, fps: int = 30,
                  dpr: float = 1.0, logical_origin: tuple = (0, 0),
-                 audio_offset_ms: int = 0):
+                 target_height: int = None, mic_muted: bool = False,
+                 webcam_latency_ms: int = 0):
         super().__init__()
+        self._initial_mic_muted = bool(mic_muted)
         self.region = dict(region)
         self.output_path = output_path
         self.fps = fps
         self.dpr = dpr
         self.logical_origin = logical_origin
-        # +ms delays audio (use if voice is ahead of lips); -ms advances audio
-        # (use if voice lags behind lips). The user-tunable "sync offset".
-        self.audio_offset_ms = int(audio_offset_ms)
+        # If set (e.g. 1080), the encoded video is scaled to this height
+        # (aspect preserved). None = record at the captured/native size.
+        self.target_height = target_height
+        # The on-screen webcam circle lags the voice (camera -> cv2 -> preview
+        # -> screen-capture pipeline). When the webcam is on we delay the audio
+        # by this much so the voice lands on the lips. 0 = no webcam, no delay.
+        self.webcam_latency_ms = int(webcam_latency_ms)
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # Not paused initially
@@ -327,7 +385,12 @@ class ScreenRecorder(QThread):
             sys_capture = None
             mic_capture = None
             audio_sample_rate = 48000
-            t_audio_start = time.perf_counter()
+            # Each source begins capturing at a DIFFERENT moment (the system
+            # helper blocks until ready; the mic starts after). We record each
+            # one's real start time and later align each to the video start, so
+            # voice and system audio both line up with the picture — no manual
+            # offset needed.
+            sys_start = mic_start = None
 
             # System audio via ScreenCaptureKit (macOS 13+)
             if IS_MACOS:
@@ -335,6 +398,7 @@ class ScreenRecorder(QThread):
                     from audio_helper import SystemAudioCapture
                     sys_capture = SystemAudioCapture(sample_rate=audio_sample_rate)
                     sys_capture.start()
+                    sys_start = time.perf_counter()  # capturing as of now
                 except Exception as e:
                     print(f"System audio unavailable: {e}")
                     sys_capture = None
@@ -344,6 +408,9 @@ class ScreenRecorder(QThread):
                 from audio_helper import MicCapture
                 mic_capture = MicCapture(sample_rate=audio_sample_rate)
                 mic_capture.start()
+                mic_start = time.perf_counter()  # first mic samples as of now
+                if self._initial_mic_muted:
+                    mic_capture.set_muted(True)  # start muted if mic was off in setup
             except Exception as e:
                 print(f"Mic capture unavailable: {e}")
                 mic_capture = None
@@ -363,11 +430,21 @@ class ScreenRecorder(QThread):
             # Use MKV container — MP4 muxer triggers errno 22 on macOS with PyAV
             frame_interval = 1.0 / self.fps
             temp_container = temp_video.replace('.mp4', '.mkv')  # Write to MKV, remux to MP4 later
+            # Output resolution: optionally scale to a target height (e.g. 1080p),
+            # preserving aspect ratio, with even dimensions (required by H.264).
+            out_w, out_h = self.region['width'], self.region['height']
+            if self.target_height and out_h != self.target_height:
+                scale = self.target_height / out_h
+                out_h = self.target_height - (self.target_height % 2)
+                out_w = max(2, int(round(self.region['width'] * scale)))
+                out_w -= out_w % 2
+            self._out_w, self._out_h = out_w, out_h
+
             container = av.open(temp_container, mode='w', format='matroska')
             stream = container.add_stream('libx264', rate=self.fps)
             stream.time_base = Fraction(1, self.fps)
-            stream.width = self.region['width']
-            stream.height = self.region['height']
+            stream.width = out_w
+            stream.height = out_h
             stream.pix_fmt = 'yuv420p'
             stream.options = {'preset': 'ultrafast', 'crf': '23'}
 
@@ -437,6 +514,14 @@ class ScreenRecorder(QThread):
                         except Exception:
                             pass
 
+                    # Scale to the target output resolution (e.g. 1080p) if set.
+                    if frame.shape[1] != self._out_w or frame.shape[0] != self._out_h:
+                        import cv2
+                        interp = (cv2.INTER_AREA if self._out_h < frame.shape[0]
+                                  else cv2.INTER_LANCZOS4)
+                        frame = cv2.resize(frame, (self._out_w, self._out_h),
+                                           interpolation=interp)
+
                     video_frame = av.VideoFrame.from_ndarray(frame, format='rgb24')
                     # Wall-clock PTS for lip sync; max() ensures monotonic (avoids mux errno 22)
                     active_elapsed = (time.perf_counter()
@@ -487,13 +572,27 @@ class ScreenRecorder(QThread):
 
                 print(f"Audio captured: system={len(sys_stereo)} frames, mic={len(mic_mono)} samples")
 
-                mixed_stereo = mix_and_master(sys_stereo, mic_mono, sample_rate=audio_sample_rate)
+                # Align EACH source to the video start so both line up with the
+                # picture (they begin capturing at different moments). A source
+                # that started BEFORE the first frame has its lead-in trimmed;
+                # one that started AFTER is padded with silence. This is what
+                # keeps voice on the lips automatically — no manual offset.
+                def _align(arr, src_start, channels):
+                    if src_start is None or len(arr) == 0:
+                        return arr
+                    lead = self._recording_start - src_start  # secs source leads video
+                    n = int(round(lead * audio_sample_rate))
+                    if n > 0:
+                        return arr[n:] if len(arr) > n else arr[:0]
+                    if n < 0:
+                        shape = (-n, channels) if channels > 1 else (-n,)
+                        return np.concatenate([np.zeros(shape, dtype=arr.dtype), arr])
+                    return arr
 
-                # Trim audio lead: audio starts before first video frame; remove excess for sync
-                audio_lead = max(0.0, self._recording_start - t_audio_start)
-                trim_samples = int(audio_lead * audio_sample_rate)
-                if trim_samples > 0 and len(mixed_stereo) > trim_samples:
-                    mixed_stereo = mixed_stereo[trim_samples:]
+                sys_stereo = _align(sys_stereo, sys_start, 2)
+                mic_mono = _align(mic_mono, mic_start, 1)
+
+                mixed_stereo = mix_and_master(sys_stereo, mic_mono, sample_rate=audio_sample_rate)
 
                 # Remove paused segments from audio
                 if self._pause_intervals:
@@ -501,17 +600,14 @@ class ScreenRecorder(QThread):
                         mixed_stereo, self._pause_intervals, audio_sample_rate
                     )
 
-                # --- Lip-sync offset (user-tunable, like OBS "sync offset") ---
-                # +ms: delay audio (pad silence in front). -ms: advance audio
-                # (trim from front) — use this if your voice lags your lips.
-                offset_samples = int(self.audio_offset_ms / 1000.0 * audio_sample_rate)
-                if offset_samples > 0:
-                    mixed_stereo = np.concatenate(
-                        [np.zeros((offset_samples, 2), dtype=np.float32), mixed_stereo]
-                    )
-                elif offset_samples < 0:
-                    cut = min(-offset_samples, len(mixed_stereo))
-                    mixed_stereo = mixed_stereo[cut:]
+                # --- Webcam lip-sync: delay the audio so the voice lands on the
+                # (pipeline-delayed) on-screen lips. Only when the webcam is on. ---
+                if self.webcam_latency_ms > 0 and len(mixed_stereo) > 0:
+                    pad = int(self.webcam_latency_ms / 1000.0 * audio_sample_rate)
+                    if pad > 0:
+                        mixed_stereo = np.concatenate(
+                            [np.zeros((pad, 2), dtype=np.float32), mixed_stereo]
+                        )
 
                 # --- Anti-drift: force audio length == actual video length so
                 # the two can't drift apart over a long recording (ends stay
@@ -702,6 +798,14 @@ class RecordingFrame(QWidget):
         # Click-through: events pass to content beneath (no NSView crash)
         _configure_nswindow(self, click_through=True, level=25)
         self._handle.show()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        # The drag handle is a SEPARATE top-level window, so hiding the frame
+        # doesn't hide it. Keep them in lockstep — otherwise the three red dots
+        # linger on screen after Stop until full teardown.
+        if getattr(self, "_handle", None):
+            self._handle.hide()
 
     def _on_handle_dragged(self, dx, dy):
         """Move the entire recording frame and handle by (dx, dy)."""

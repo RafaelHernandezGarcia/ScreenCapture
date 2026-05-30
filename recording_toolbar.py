@@ -7,7 +7,7 @@ pause/resume, stop, timer, mic mute, webcam toggle, draw toggle.
 import sys
 from PyQt6.QtCore import Qt, QRect, QSize, QTimer, pyqtSignal, QSettings
 from PyQt6.QtGui import (
-    QPainter, QColor, QFont, QPen, QIcon, QPixmap, QPainterPath
+    QPainter, QColor, QFont, QPen, QIcon, QPixmap, QPainterPath, QLinearGradient
 )
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QLabel,
@@ -176,6 +176,91 @@ class ToolbarButton(QToolButton):
         """)
 
 
+class StopButton(QToolButton):
+    """Primary 'Stop' action: a raised red pill with unmistakable hover and a
+    real tactile press.
+
+    Painted by hand (not stylesheet) so it actually reads as pressable:
+    glossy top sheen + top-light/bottom-dark gradient at rest (a raised
+    button), a clearly brighter fill plus a white ring on hover (strong
+    contrast), and on press it visibly SINKS — flat darker fill, no sheen,
+    nudged down, square shrunk.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hover = False
+        self._pressed = False
+        self.setFixedSize(46, 36)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Stop Recording")
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self._pressed = False
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pressed = True
+            self.update()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._pressed = False
+        self.update()
+        super().mouseReleaseEvent(event)   # QAbstractButton emits clicked
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect().adjusted(1, 1, -1, -1)
+        radius = 10
+
+        if self._pressed:
+            c_top, c_bot = QColor("#B5333A"), QColor("#A22D33")
+        elif self._hover:
+            c_top, c_bot = QColor("#FF6166"), QColor("#EC474D")
+        else:
+            c_top, c_bot = QColor("#F24A4F"), QColor("#D63A40")
+
+        # Pressed body sinks 1px and loses its raised gradient/sheen.
+        body = r.adjusted(0, 1, 0, 1) if self._pressed else r
+        grad = QLinearGradient(float(body.left()), float(body.top()),
+                               float(body.left()), float(body.bottom()))
+        grad.setColorAt(0.0, c_top)
+        grad.setColorAt(1.0, c_bot)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(grad)
+        p.drawRoundedRect(body, radius, radius)
+
+        if not self._pressed:
+            # Glossy top highlight = raised/pressable look.
+            p.setBrush(QColor(255, 255, 255, 42))
+            p.drawRoundedRect(body.x() + 3, body.y() + 2,
+                              body.width() - 6, int(body.height() * 0.46),
+                              radius - 3, radius - 3)
+
+        if self._hover and not self._pressed:
+            # White ring: strong, obvious hover contrast.
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(255, 255, 255, 170), 1.5))
+            p.drawRoundedRect(body.adjusted(1, 1, -1, -1), radius - 1, radius - 1)
+
+        # White stop square (slightly smaller when pressed).
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("white"))
+        sq = 11 if self._pressed else 12
+        cx = body.x() + body.width() // 2
+        cy = body.y() + body.height() // 2
+        p.drawRoundedRect(cx - sq // 2, cy - sq // 2, sq, sq, 2, 2)
+        p.end()
+
+
 class RecordingToolbar(QWidget):
     """ScreenPal-style floating recording toolbar.
 
@@ -250,9 +335,9 @@ class RecordingToolbar(QWidget):
         self._pause_btn.clicked.connect(self._on_pause)
         layout.addWidget(self._pause_btn)
 
-        # Stop button
-        stop_icon = _make_icon(_draw_stop, color="#e63946")
-        self._stop_btn = ToolbarButton(stop_icon, "Stop Recording", self)
+        # Stop button — custom raised red pill (see StopButton) so it clearly
+        # reads as pressable at rest, jumps on hover, and sinks when clicked.
+        self._stop_btn = StopButton(self)
         self._stop_btn.clicked.connect(self.stop_clicked.emit)
         layout.addWidget(self._stop_btn)
 
@@ -264,14 +349,21 @@ class RecordingToolbar(QWidget):
         layout.addWidget(sep1)
         layout.addSpacing(4)
 
+        # Live red REC dot (pulses)
+        self._rec_dot = QLabel("●", self)
+        self._rec_dot.setStyleSheet("color:#FF453A; font-size:13px; background:transparent;")
+        self._rec_dot.setFixedWidth(16)
+        self._rec_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._rec_dot)
+
         # Timer label
         self._timer_label = QLabel("0:00", self)
         self._timer_label.setStyleSheet(
             f"color: white; font-family: '{SYSTEM_FONT}'; "
-            "font-size: 14px; font-weight: bold; background: transparent;"
+            "font-size: 14px; font-weight: 600; background: transparent;"
         )
-        self._timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._timer_label.setFixedWidth(50)
+        self._timer_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._timer_label.setFixedWidth(46)
         layout.addWidget(self._timer_label)
 
         # Separator
@@ -304,26 +396,38 @@ class RecordingToolbar(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        from recorder import _configure_nswindow
-        _configure_nswindow(self, click_through=False, level=25)
+        # Non-activating clickable panel: buttons respond on first hover/click
+        # without stealing focus from what's being recorded.
+        from recorder import _configure_clickable_panel
+        _configure_clickable_panel(self, level=25)
+        self.setMouseTracking(True)
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Semi-transparent dark rounded background
+        r = self.rect()
+        # Deep, near-black translucent pill (frosted-dark look).
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(30, 30, 30, 220))
-        p.drawRoundedRect(self.rect(), 12, 12)
-        # Subtle border
-        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.setBrush(QColor(28, 28, 30, 236))
+        p.drawRoundedRect(r, 17, 17)
+        # Hairline top highlight + soft border for depth.
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 12, 12)
+        p.setPen(QPen(QColor(255, 255, 255, 28), 1))
+        p.drawRoundedRect(r.adjusted(0, 0, -1, -1), 17, 17)
         p.end()
 
     def _tick(self):
         self._elapsed += 1
         m, s = divmod(self._elapsed, 60)
         self._timer_label.setText(f"{m}:{s:02d}")
+        # Pulse the REC dot (dim/bright each second) — unless paused.
+        if hasattr(self, "_rec_dot"):
+            if self._is_paused:
+                self._rec_dot.setStyleSheet("color:#8E8E93; font-size:13px; background:transparent;")
+            else:
+                on = (self._elapsed % 2 == 0)
+                shade = "#FF453A" if on else "#7A1F1B"
+                self._rec_dot.setStyleSheet(f"color:{shade}; font-size:13px; background:transparent;")
 
     def _on_pause(self):
         if self._is_paused:
@@ -372,6 +476,13 @@ class RecordingToolbar(QWidget):
         self._cam_btn.setChecked(True)
         self._cam_btn.setIcon(self._cam_on_icon)
         self._cam_btn.setToolTip("Disable Webcam")
+
+    def set_mic_muted(self, muted: bool):
+        """Reflect the mic mute state chosen in the setup panel."""
+        self._mic_muted = bool(muted)
+        self._mic_btn.setChecked(bool(muted))
+        self._mic_btn.setIcon(self._mic_off_icon if muted else self._mic_on_icon)
+        self._mic_btn.setToolTip("Unmute Microphone" if muted else "Mute Microphone")
 
     def _on_draw(self):
         self._draw_active = self._draw_btn.isChecked()

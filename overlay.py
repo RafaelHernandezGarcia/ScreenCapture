@@ -18,7 +18,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QWidget, QApplication, QToolButton, QHBoxLayout,
     QVBoxLayout, QFrame, QColorDialog, QFileDialog, QInputDialog, QButtonGroup,
-    QLabel, QLineEdit, QCheckBox, QDialog, QPushButton
+    QLabel, QLineEdit, QCheckBox, QDialog, QPushButton, QGraphicsDropShadowEffect
 )
 from PIL import Image
 
@@ -183,21 +183,24 @@ class HoverButton(QToolButton):
         # FIX 1: Explicitly force Arrow Cursor on the button itself
         self.setCursor(Qt.CursorShape.ArrowCursor)
         
-        # Pre-generate icons
-        self.icon_normal = IconFactory.create_icon(icon_name, QColor("#333333"))
-        self.icon_active = IconFactory.create_icon(icon_name, QColor("#0099ff"))
-        
+        # Pre-generate icons — clean ink at rest, brand purple when active.
+        self.icon_normal = IconFactory.create_icon(icon_name, QColor("#3C3C43"))
+        self.icon_active = IconFactory.create_icon(icon_name, QColor("#7A1FA6"))
+
         self.setIcon(self.icon_normal)
         self.setIconSize(QSize(40, 40))
-        
+
         self.setStyleSheet("""
             QToolButton {
                 background: transparent;
                 border: none;
-                border-radius: 2px;
+                border-radius: 9px;
+            }
+            QToolButton:hover {
+                background: #F2F2F7;
             }
             QToolButton:checked {
-                background: #e0e0e0;
+                background: #EFE8FB;
             }
         """)
         
@@ -443,6 +446,14 @@ class OverlayWindow(QWidget):
         # Must be focusable or keyPressEvent (Esc / ⌘C / ⌘S / ⌘Z) never fires.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
+    def _add_card_shadow(self, widget):
+        """Soft drop shadow for a floating toolbar card (depth, Loom-like)."""
+        eff = QGraphicsDropShadowEffect(widget)
+        eff.setBlurRadius(36)
+        eff.setColor(QColor(0, 0, 0, 80))
+        eff.setOffset(0, 8)
+        widget.setGraphicsEffect(eff)
+
     def _create_toolbars(self):
         # Vertical Toolbar (Tools)
         self.tool_toolbar = QFrame(self)
@@ -451,15 +462,16 @@ class OverlayWindow(QWidget):
         
         self.tool_toolbar.setStyleSheet("""
             QFrame {
-                background: #eeeeee;
-                border: 1px solid #cccccc;
-                border-radius: 2px;
+                background: #FFFFFF;
+                border: 1px solid #E5E5EA;
+                border-radius: 18px;
             }
         """)
-        
+        self._add_card_shadow(self.tool_toolbar)
+
         tool_layout = QVBoxLayout(self.tool_toolbar)
-        tool_layout.setContentsMargins(2, 2, 2, 2)
-        tool_layout.setSpacing(0)
+        tool_layout.setContentsMargins(6, 6, 6, 6)
+        tool_layout.setSpacing(3)
         
         self.tool_group = QButtonGroup(self)
         self.tool_group.setExclusive(True)
@@ -511,15 +523,16 @@ class OverlayWindow(QWidget):
         
         self.action_toolbar.setStyleSheet("""
             QFrame {
-                background: #eeeeee;
-                border: 1px solid #cccccc;
-                border-radius: 2px;
+                background: #FFFFFF;
+                border: 1px solid #E5E5EA;
+                border-radius: 18px;
             }
         """)
-        
+        self._add_card_shadow(self.action_toolbar)
+
         action_layout = QHBoxLayout(self.action_toolbar)
-        action_layout.setContentsMargins(2, 2, 2, 2)
-        action_layout.setSpacing(0)
+        action_layout.setContentsMargins(6, 6, 6, 6)
+        action_layout.setSpacing(3)
         
         actions = [
             ("record", "Record Screen", self._record),
@@ -943,18 +956,12 @@ class OverlayWindow(QWidget):
             
             painter.setClipping(False)
             
-            pen_white = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.CustomDashLine)
-            pen_white.setDashPattern([4, 4])
-            painter.setPen(pen_white)
+            # Clean solid purple selection border (brand color), replacing the
+            # old dashed black/white outline.
+            painter.setPen(QPen(QColor("#7A1FA6"), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect)
-            
-            pen_black = QPen(Qt.GlobalColor.black, 1, Qt.PenStyle.CustomDashLine)
-            pen_black.setDashPattern([4, 4])
-            pen_black.setDashOffset(4)
-            painter.setPen(pen_black)
-            painter.drawRect(rect)
-            
+
             if self.selection_complete:
                 self._draw_handles(painter, rect)
                 self._draw_dimensions(painter, rect)

@@ -59,6 +59,20 @@ def list_cameras(max_check=5):
 class WebcamCapture(QThread):
     """Captures webcam frames in a background thread."""
 
+    # Fired every time a fresh frame is stored, so the preview can repaint
+    # exactly when a new frame is ready (event-driven) instead of on a
+    # free-running timer that beats against the camera's rate and judders.
+    frame_ready = pyqtSignal()
+
+    # Capture mode we ASK the camera for. Without this, OpenCV opens the
+    # camera in its default mode — usually the highest native resolution —
+    # which delivers full-res uncompressed frames at a sluggish rate and
+    # makes motion look laggy (the better the camera, the worse it gets).
+    # 720p30 is exactly what Google Meet / WhatsApp request: smooth, light,
+    # and far more than enough for a small circular PiP.
+    CAPTURE_WIDTH = 1280
+    CAPTURE_HEIGHT = 720
+
     def __init__(self, device_index=0, fps=30):
         super().__init__()
         self._device_index = device_index
@@ -77,42 +91,63 @@ class WebcamCapture(QThread):
     def stop(self):
         self._stop_event.set()
 
+    def _open_and_configure(self, cv2, index):
+        """Open a camera at `index` and ask it for a smooth, low-latency mode.
+
+        Returns an opened VideoCapture or None. Setting the capture mode is
+        what keeps motion fluid: a fixed 720p30 with a 1-frame buffer means
+        we always read the FRESHEST frame at a steady rate, instead of
+        draining a deep buffer of stale full-res frames.
+        """
+        cap = cv2.VideoCapture(index)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.CAPTURE_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.CAPTURE_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, self._fps)
+        # Keep the internal buffer shallow so read() returns the latest frame
+        # (low latency) rather than a queued, already-stale one. Not every
+        # backend honors this, so it's best-effort.
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        return cap
+
     def run(self):
         import cv2
         import time
 
-        cap = cv2.VideoCapture(self._device_index)
-        if not cap.isOpened():
+        cap = self._open_and_configure(cv2, self._device_index)
+        if cap is None:
             print(f"[webcam] Camera index {self._device_index} could not be opened")
             # Try fallback indices
             for fallback in range(5):
                 if fallback == self._device_index:
                     continue
-                cap = cv2.VideoCapture(fallback)
-                if cap.isOpened():
+                cap = self._open_and_configure(cv2, fallback)
+                if cap is not None:
                     print(f"[webcam] Fell back to camera index {fallback}")
                     break
-                cap.release()
-            else:
+            if cap is None:
                 print("[webcam] No working camera found")
                 return
 
-        frame_interval = 1.0 / self._fps
-
         try:
             while not self._stop_event.is_set():
-                t0 = time.perf_counter()
+                # read() blocks until the next sensor frame, so it paces the
+                # loop to the camera's real frame rate (≈30fps) on its own —
+                # no artificial sleep needed, which only added latency.
                 ret, frame = cap.read()
                 if ret and frame is not None:
                     # Flip horizontally for mirror effect
                     frame = cv2.flip(frame, 1)
                     with self._lock:
                         self._latest_frame = frame
-
-                elapsed = time.perf_counter() - t0
-                sleep_time = frame_interval - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                    self.frame_ready.emit()  # wake the preview to repaint
+                else:
+                    time.sleep(0.005)  # transient read failure; back off briefly
         finally:
             cap.release()
 
@@ -147,19 +182,35 @@ class WebcamPreviewWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(diameter + 6, diameter + 6)  # +6 for border
 
-        # Position at bottom-right of recording region (clamped inside it)
-        x = recording_rect.right() - diameter - 20
-        y = recording_rect.bottom() - diameter - 20
-        x, y = self._clamp_pos(x, y)
-        self.move(x, y)
+        # Start tucked into the bottom-right corner, hugging the recording
+        # border. The visible ring sits 3px inside the widget box, so we offset
+        # by that. Right and bottom margins are computed identically, but a
+        # tiny extra downward bias balances a sub-pixel corner-rounding
+        # asymmetry that reads as "closer to the right than the bottom".
+        margin = 12
+        bottom_bias = 3            # nudge the circle a hair lower to look even
+        ring_inset = 3
+        x = recording_rect.right() - self.width() + ring_inset - margin
+        y = recording_rect.bottom() - self.height() + ring_inset - margin + bottom_bias
+        cx, cy = self._clamp_pos(x, y)
+        # A move() issued before the native window is realized drifts upward
+        # ~20px on macOS (Qt reports it lower than requested), which made the
+        # circle sit too high — tight on the right but loose on the bottom. We
+        # stash the target and re-assert it in _apply_nswindow once the window
+        # exists, where the position sticks exactly.
+        self._target_pos = (int(cx), int(cy))
+        self.move(int(cx), int(cy))
 
         # Circular mask
         self._update_mask()
 
-        # Refresh timer
+        # Repaint when a fresh camera frame lands (smooth, no timer beating).
+        # A slow fallback timer keeps it alive if the camera stalls.
+        if self._webcam is not None:
+            self._webcam.frame_ready.connect(self.update)
         self._refresh = QTimer(self)
         self._refresh.timeout.connect(self.update)
-        self._refresh.start(33)  # ~30fps
+        self._refresh.start(200)  # fallback only; frames drive the repaint
 
     def _update_mask(self):
         diameter = self._radius * 2 + 6
@@ -186,6 +237,11 @@ class WebcamPreviewWidget(QWidget):
     def _apply_nswindow(self):
         from recorder import _configure_nswindow
         _configure_nswindow(self, click_through=False, level=25)
+        # Re-assert the target position now that the native window is realized;
+        # the pre-show move() drifted ~20px up on macOS. This makes it land
+        # exactly, so the circle's right and bottom gaps match.
+        if getattr(self, "_target_pos", None) is not None:
+            self.move(*self._target_pos)
         # Drop the window shadow: a circular translucent window leaves a
         # shadow "ghost" trailing behind it while you drag it on macOS.
         try:

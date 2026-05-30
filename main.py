@@ -266,6 +266,7 @@ class ScreenCaptureApp:
         self._toolbar: Optional[RecordingToolbar] = None
         self._draw_panel: Optional[DrawingSubPanel] = None
         self._countdown: Optional[CountdownOverlay] = None
+        self._setup_panel = None  # pre-recording Loom-style setup card
         self._is_recording = False
         self._last_screen_geo: Optional[QRect] = None
         self._last_capture_dpr: float = 1.0
@@ -318,7 +319,7 @@ class ScreenCaptureApp:
 
         # Qt context menu — used on Windows. On macOS the native menu mirrors it.
         menu = QMenu()
-        capture_action = QAction("Capture Screen", menu)
+        capture_action = QAction("New Screenshot", menu)
         capture_action.triggered.connect(self.start_capture)
         menu.addAction(capture_action)
         self._stop_recording_action = QAction("Stop Recording", menu)
@@ -326,25 +327,28 @@ class ScreenCaptureApp:
         self._stop_recording_action.setVisible(False)
         menu.addAction(self._stop_recording_action)
         menu.addSeparator()
+
+        # Settings group
         self.hotkey_menu_action = QAction(
-            f"Hotkey: {self.hotkey_name}  (click to change)", menu)
+            f"Capture Shortcut:  {self.hotkey_name}", menu)
         self.hotkey_menu_action.triggered.connect(self._change_hotkey)
         menu.addAction(self.hotkey_menu_action)
-        self._camera_menu = QMenu("Camera", menu)
+        self._camera_menu = QMenu("Webcam", menu)
         self._camera_menu.aboutToShow.connect(self._populate_camera_menu)
         menu.addMenu(self._camera_menu)
-        self._audio_sync_menu = QMenu("Audio Sync (lip-sync)", menu)
-        self._audio_sync_menu.aboutToShow.connect(self._populate_audio_sync_menu)
-        menu.addMenu(self._audio_sync_menu)
+        self._rec_size_menu = QMenu("Recording Quality", menu)
+        self._rec_size_menu.aboutToShow.connect(self._populate_rec_size_menu)
+        menu.addMenu(self._rec_size_menu)
+        menu.addSeparator()
+
         open_recordings_action = QAction("Open Recordings Folder", menu)
         open_recordings_action.triggered.connect(self._open_recordings_folder)
         menu.addAction(open_recordings_action)
-        menu.addSeparator()
-        about_action = QAction("About", menu)
+        about_action = QAction("About ScreenCapture", menu)
         about_action.triggered.connect(self._show_about)
         menu.addAction(about_action)
         menu.addSeparator()
-        quit_action = QAction("Exit", menu)
+        quit_action = QAction("Quit ScreenCapture", menu)
         quit_action.triggered.connect(self._quit)
         menu.addAction(quit_action)
         self.tray.setContextMenu(menu)
@@ -379,36 +383,28 @@ class ScreenCaptureApp:
                 checked=(idx == self._camera_index),
             )
 
-    def _populate_audio_sync_menu(self):
-        """Lip-sync offset chooser (like OBS's audio sync offset)."""
-        self._audio_sync_menu.clear()
-        current = int(self.config.get("audio_offset_ms", 0))
-        hint = QAction("If your voice LAGS your lips, pick 'earlier'", self._audio_sync_menu)
+    def _populate_rec_size_menu(self):
+        """Choose the recorded video resolution."""
+        self._rec_size_menu.clear()
+        current = self.config.get("recording_size", "native")
+        hint = QAction("Scales the video; aspect ratio kept", self._rec_size_menu)
         hint.setEnabled(False)
-        self._audio_sync_menu.addAction(hint)
-        self._audio_sync_menu.addSeparator()
-        # negative = advance the voice (fixes the common "audio is late" lag)
-        options = [
-            ("Voice much earlier  (−200 ms)", -200),
-            ("Voice earlier  (−120 ms)", -120),
-            ("Voice slightly earlier  (−60 ms)", -60),
-            ("In sync  (0 ms)", 0),
-            ("Voice slightly later  (+60 ms)", 60),
-            ("Voice later  (+120 ms)", 120),
-        ]
-        for label, ms in options:
-            act = QAction(label, self._audio_sync_menu)
+        self._rec_size_menu.addAction(hint)
+        self._rec_size_menu.addSeparator()
+        for label, key in [("Native (selection size)", "native"),
+                           ("1080p", "1080p"), ("720p", "720p")]:
+            act = QAction(label, self._rec_size_menu)
             act.setCheckable(True)
-            act.setChecked(ms == current)
-            act.triggered.connect(lambda checked, m=ms: self._set_audio_offset(m))
-            self._audio_sync_menu.addAction(act)
+            act.setChecked(key == current)
+            act.triggered.connect(lambda checked, k=key: self._set_rec_size(k))
+            self._rec_size_menu.addAction(act)
 
-    def _set_audio_offset(self, ms: int):
-        self.config["audio_offset_ms"] = int(ms)
+    def _set_rec_size(self, key: str):
+        self.config["recording_size"] = key
         save_config(self.config)
         self.tray.showMessage(
             "ScreenCapture",
-            f"Audio sync set to {ms:+d} ms — applies to your next recording.",
+            f"Recording size: {key} — applies to your next recording.",
             QSystemTrayIcon.MessageIcon.Information, 2500,
         )
 
@@ -495,7 +491,7 @@ class ScreenCaptureApp:
             save_config(self.config)
 
             # Update UI
-            self._set_hotkey_label(f"Hotkey: {self.hotkey_name}  (click to change)")
+            self._set_hotkey_label(f"Capture Shortcut:  {self.hotkey_name}")
             self.tray.setToolTip(f"ScreenCapture - Press {self.hotkey_name} to capture")
 
             # Restart hotkey listener
@@ -693,13 +689,83 @@ class ScreenCaptureApp:
             selection_rect.height(),
         )
 
-        # Show countdown on the screen where capture happened
-        self._countdown = CountdownOverlay(geo)
+        # --- Loom-style setup phase ---
+        # Show the recording-area border + a setup card so the user can place
+        # their webcam and toggle camera/mic, then press Start when ready.
+        self._recording_frame = RecordingFrame(self._pending_logical_rect)
+        self._recording_frame.region_moved.connect(self._on_region_moved)
+        self._recording_frame.show()
+
+        cam_default = bool(self.config.get("webcam_default", False))
+        mic_default = bool(self.config.get("mic_default", True))
+        if cam_default and self._camera_authorized():
+            self._show_webcam_preview()
+
+        from setup_panel import SetupPanel
+        self._setup_panel = SetupPanel(
+            geo,
+            camera_name=self._current_camera_name(),
+            mic_name="Microphone",
+            webcam_on=cam_default,
+            mic_on=mic_default,
+        )
+        self._setup_panel.webcam_toggled.connect(self._on_webcam_toggled)
+        self._setup_panel.mic_toggled.connect(self._on_setup_mic)
+        self._setup_panel.start_clicked.connect(self._begin_countdown)
+        self._setup_panel.cancel_clicked.connect(self._cancel_setup)
+        self._setup_panel.show()
+
+    # -- setup-phase helpers ----------------------------------------------
+
+    def _camera_authorized(self) -> bool:
+        if not IS_MACOS:
+            return True
+        try:
+            from platform_utils import camera_permission_status
+            return camera_permission_status() == "authorized"
+        except Exception:
+            return True
+
+    def _current_camera_name(self) -> str:
+        try:
+            cams = self._available_cameras or list_cameras()
+            for idx, name in cams:
+                if idx == self._camera_index:
+                    return name
+            if cams:
+                return cams[0][1]
+        except Exception:
+            pass
+        return "Webcam"
+
+    def _on_setup_mic(self, on: bool):
+        self.config["mic_default"] = bool(on)
+        save_config(self.config)
+
+    def _begin_countdown(self):
+        """Start clicked in the setup panel → countdown → recording."""
+        if self._setup_panel:
+            self._setup_panel.close()
+            self._setup_panel = None
+        geo = self._last_screen_geo
+        self._countdown = CountdownOverlay(geo, region_rect=self._pending_logical_rect)
         self._countdown.countdown_finished.connect(self._start_recording)
         self._countdown.show()
 
+    def _cancel_setup(self):
+        """X in the setup panel → tear everything down, no recording."""
+        if self._setup_panel:
+            self._setup_panel.close()
+            self._setup_panel = None
+        self._hide_webcam_preview()
+        if self._recording_frame:
+            self._recording_frame.close()
+            self._recording_frame = None
+        self._pending_record_region = None
+        self._pending_logical_rect = None
+
     def _start_recording(self):
-        """Start the actual screen recording after countdown finishes."""
+        """Start the actual screen recording after the countdown finishes."""
         self._countdown = None
         region = self._pending_record_region
         if not region:
@@ -709,19 +775,27 @@ class ScreenCaptureApp:
         output_path = os.path.join(output_dir, generate_filename())
 
         logical_origin = (self._pending_logical_rect.x(), self._pending_logical_rect.y())
+        target_height = {"1080p": 1080, "720p": 720}.get(
+            self.config.get("recording_size"), None)
         self._recorder = ScreenRecorder(
             region, output_path,
             dpr=self._last_capture_dpr,
             logical_origin=logical_origin,
-            audio_offset_ms=self.config.get("audio_offset_ms", 0),
+            target_height=target_height,
+            mic_muted=not bool(self.config.get("mic_default", True)),
+            # Webcam circle lags the voice through the camera→preview→capture
+            # pipeline; delay audio to match it. ~160 ms is a typical webcam
+            # pipeline latency. Only applied when the webcam is on.
+            webcam_latency_ms=(160 if self._webcam_preview is not None else 0),
         )
         self._recorder.recording_stopped.connect(self._on_recording_stopped)
         self._recorder.recording_error.connect(self._on_recording_error)
 
-        # Show recording frame border (draggable via grip handle)
-        self._recording_frame = RecordingFrame(self._pending_logical_rect)
-        self._recording_frame.region_moved.connect(self._on_region_moved)
-        self._recording_frame.show()
+        # The recording-area border is already on screen from the setup phase.
+        if self._recording_frame is None:
+            self._recording_frame = RecordingFrame(self._pending_logical_rect)
+            self._recording_frame.region_moved.connect(self._on_region_moved)
+            self._recording_frame.show()
 
         # Create annotation overlay (starts click-through / inactive)
         try:
@@ -751,23 +825,15 @@ class ScreenCaptureApp:
             print(f"[DEBUG] RecordingToolbar FAILED: {e}")
             import traceback; traceback.print_exc()
 
-        # If the webcam was on last time, bring the circle up automatically so
-        # it's there from the start — no mid-recording click + wait.
-        if self.config.get("webcam_default"):
-            authorized = True
-            if IS_MACOS:
+        # Reflect the webcam/mic choices made in the setup panel on the toolbar.
+        if self._toolbar:
+            if self._webcam_preview is not None:
+                self._toolbar.set_webcam_on()
+            if not bool(self.config.get("mic_default", True)):
                 try:
-                    from platform_utils import camera_permission_status
-                    authorized = camera_permission_status() == "authorized"
+                    self._toolbar.set_mic_muted(True)
                 except Exception:
-                    authorized = True
-            if authorized:
-                try:
-                    self._start_webcam()
-                    if self._toolbar:
-                        self._toolbar.set_webcam_on()
-                except Exception as e:
-                    print(f"[webcam] auto-start failed: {e}")
+                    pass
 
         self._is_recording = True
         self._set_stop_visible(True)
@@ -794,45 +860,53 @@ class ScreenCaptureApp:
         self.config["webcam_default"] = bool(on)
         save_config(self.config)
         if on:
-            # Camera needs explicit TCC permission. OpenCV is told to skip
-            # its own auth request (OPENCV_AVFOUNDATION_SKIP_AUTH), so we
-            # request via AVFoundation and only open the camera once granted.
+            # Camera needs explicit TCC permission. OpenCV is told to skip its
+            # own auth request, so request via AVFoundation and only open the
+            # camera once granted. Works in BOTH the setup phase and during
+            # recording (no recorder dependency — the preview is captured).
             if IS_MACOS:
                 from platform_utils import camera_permission_status, request_camera_permission
                 status = camera_permission_status()
                 if status == "authorized":
-                    self._start_webcam()
+                    self._show_webcam_preview()
                 elif status == "not_determined":
-                    # Async system prompt; result comes back on another
-                    # thread, so marshal it to the main thread via a signal.
                     request_camera_permission(
                         lambda g: self.signal_emitter.camera_result.emit(bool(g))
                     )
                 else:  # denied / restricted
                     self._show_camera_denied()
             else:
-                self._start_webcam()
+                self._show_webcam_preview()
         else:
-            self._stop_webcam()
+            self._hide_webcam_preview()
 
-    def _start_webcam(self):
-        """Open the camera and show the circular PiP preview."""
-        if self._webcam or not self._recorder:
+    def _show_webcam_preview(self):
+        """Open the camera (if needed) and show the draggable circular PiP.
+
+        Used both in the setup phase and during recording; the preview is
+        captured by the screen recorder, so no compositing is needed.
+        """
+        if self._webcam_preview is not None:
             return
-        self._webcam = WebcamCapture(device_index=self._camera_index)
-        self._webcam.start()
+        if self._pending_logical_rect is None:
+            return
+        if self._webcam is None:
+            self._webcam = WebcamCapture(device_index=self._camera_index)
+            self._webcam.start()
         self._webcam_preview = WebcamPreviewWidget(
             self._webcam,
             self._pending_logical_rect,
-            dpr=self._last_capture_dpr
+            dpr=self._last_capture_dpr,
         )
         self._webcam_preview.position_changed.connect(self._on_webcam_position)
         self._webcam_preview.show()
-        self._recorder.set_webcam(self._webcam)
+        if self._toolbar:
+            try:
+                self._toolbar.set_webcam_on()
+            except Exception:
+                pass
 
-    def _stop_webcam(self):
-        if self._recorder:
-            self._recorder.set_webcam(None)
+    def _hide_webcam_preview(self):
         if self._webcam_preview:
             self._webcam_preview.close()
             self._webcam_preview = None
@@ -844,7 +918,7 @@ class ScreenCaptureApp:
     def _on_camera_result(self, granted: bool):
         """Main-thread handler for the async camera permission result."""
         if granted:
-            self._start_webcam()
+            self._show_webcam_preview()
         else:
             self._show_camera_denied()
 
@@ -874,23 +948,28 @@ class ScreenCaptureApp:
             self._recorder.set_webcam_position(x, y, radius)
 
     def _on_region_moved(self, new_rect: QRect):
-        """Called when the user drags the red recording border."""
+        """Called when the user drags the red recording border (setup or live)."""
         dpr = self._last_capture_dpr
-
-        # Update the mss capture region (physical pixels)
-        new_phys = {
-            "left": int(new_rect.x() * dpr),
-            "top": int(new_rect.y() * dpr),
-            "width": self._recorder.region["width"],   # keep same size
-            "height": self._recorder.region["height"],
-        }
-        self._recorder.region = new_phys
-        self._recorder.logical_origin = (new_rect.x(), new_rect.y())
         self._pending_logical_rect = QRect(new_rect)
 
-        # Move annotation overlay to match
+        if self._recorder is not None:
+            self._recorder.region = {
+                "left": int(new_rect.x() * dpr),
+                "top": int(new_rect.y() * dpr),
+                "width": self._recorder.region["width"],   # keep same size
+                "height": self._recorder.region["height"],
+            }
+            self._recorder.logical_origin = (new_rect.x(), new_rect.y())
+        elif self._pending_record_region:
+            # Setup phase (no recorder yet): move the pending capture region.
+            self._pending_record_region["left"] = int(new_rect.x() * dpr)
+            self._pending_record_region["top"] = int(new_rect.y() * dpr)
+
         if self._annotation_overlay:
             self._annotation_overlay.setGeometry(new_rect)
+        # Keep the webcam circle clamped to the moved region.
+        if self._webcam_preview is not None:
+            self._webcam_preview._recording_rect = QRect(new_rect)
 
     def _on_draw_toggled(self, active: bool):
         if self._annotation_overlay:
@@ -921,9 +1000,29 @@ class ScreenCaptureApp:
             self._annotation_overlay.clear_annotations()
 
     def _stop_recording(self):
-        """Signal the recorder to stop."""
-        if self._recorder:
-            self._recorder.stop()
+        """Stop recording — and clear the UI INSTANTLY so it feels reactive.
+
+        Finalizing the file (flush encoder + mix audio + ffmpeg remux) takes a
+        beat. We don't make the user stare at the controls while it happens:
+        the overlays vanish the moment Stop is pressed, and the recorder keeps
+        finalizing on its own thread. _on_recording_stopped then does the real
+        teardown and reveals the saved file in Finder.
+        """
+        if not self._recorder:
+            return
+        # Hide (don't destroy) every on-screen recording widget right now.
+        # Destroying happens later in _cleanup_recording, once the recorder
+        # thread has finished and emitted recording_stopped.
+        for w in (self._toolbar, self._stop_btn, self._draw_panel,
+                  self._recording_frame, self._annotation_overlay,
+                  self._webcam_preview, self._setup_panel):
+            if w is not None:
+                try:
+                    w.hide()
+                except Exception:
+                    pass
+        self._set_stop_visible(False)
+        self._recorder.stop()
 
     def _on_recording_stopped(self, file_path: str):
         """Called when the recorder finishes saving."""
@@ -959,6 +1058,9 @@ class ScreenCaptureApp:
 
     def _cleanup_recording(self):
         """Clean up recording state."""
+        if self._setup_panel:
+            self._setup_panel.close()
+            self._setup_panel = None
         if self._stop_btn:
             self._stop_btn.close()
             self._stop_btn = None
@@ -988,11 +1090,22 @@ class ScreenCaptureApp:
         self._set_stop_visible(False)
 
     def _show_about(self):
-        """Show about dialog on top of all windows"""
+        """Show a clean About dialog with the feather icon."""
         msg = QMessageBox()
-        msg.setWindowTitle("About ScreenCapture")
-        msg.setText("ScreenCapture v1.1\n\nA LightShot-like screenshot tool.")
-        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setWindowTitle("ScreenCapture")
+        msg.setText("ScreenCapture")
+        msg.setInformativeText(
+            "A fast, clean screenshot & screen recorder.\n\n"
+            f"Press {self.hotkey_name} anywhere to capture — drag to select, "
+            "then copy, save, annotate, or record with webcam + audio."
+        )
+        icon_path = os.path.join(os.path.dirname(__file__), "assets", "icon.png")
+        if os.path.exists(icon_path):
+            from PyQt6.QtGui import QPixmap
+            pix = QPixmap(icon_path).scaled(
+                72, 72, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            msg.setIconPixmap(pix)
         msg.setWindowFlags(msg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         msg.exec()
     

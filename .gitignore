@@ -33,3 +33,7 @@ sc_audio_helper
 
 # Cursor
 .cursor/
+
+# Claude Code local config + preview scratch (not part of the app)
+.claude/
+_sc_preview/
