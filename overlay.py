@@ -136,21 +136,21 @@ class IconFactory:
 
         elif name == "undo":
             path = QPainterPath()
-            path.moveTo(22*s, 12*s)
-            path.quadTo(16*s, 12*s, 12*s, 16*s)
-            path.quadTo(12*s, 22*s, 18*s, 24*s)
-            painter.drawPath(path)
-            painter.drawLine(int(22*s), int(12*s), int(18*s), int(8*s))
-            painter.drawLine(int(22*s), int(12*s), int(18*s), int(16*s))
-
-        elif name == "redo":
-            path = QPainterPath()
             path.moveTo(10*s, 12*s)
             path.quadTo(16*s, 12*s, 20*s, 16*s)
             path.quadTo(20*s, 22*s, 14*s, 24*s)
             painter.drawPath(path)
             painter.drawLine(int(10*s), int(12*s), int(14*s), int(8*s))
             painter.drawLine(int(10*s), int(12*s), int(14*s), int(16*s))
+
+        elif name == "redo":
+            path = QPainterPath()
+            path.moveTo(22*s, 12*s)
+            path.quadTo(16*s, 12*s, 12*s, 16*s)
+            path.quadTo(12*s, 22*s, 18*s, 24*s)
+            painter.drawPath(path)
+            painter.drawLine(int(22*s), int(12*s), int(18*s), int(8*s))
+            painter.drawLine(int(22*s), int(12*s), int(18*s), int(16*s))
 
         elif name == "copy":
             painter.drawRect(int(14*s), int(8*s), int(12*s), int(14*s))
