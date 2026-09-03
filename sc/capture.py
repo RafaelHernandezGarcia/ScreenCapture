@@ -1,7 +1,7 @@
 """Native screen capture via CGWindowListCreateImage.
 
 One-shot, synchronous, fast (<10 ms for 1080p). Returns the pixels of
-the *current* screen state — no Qt activation, no NSApp.activateIgnoring,
+the *current* screen state - no Qt activation, no NSApp.activateIgnoring,
 no Spaces dance. The image is in physical pixels so high-DPR displays
 get true Retina resolution.
 """

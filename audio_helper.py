@@ -1,27 +1,29 @@
 """
 Audio Helper - Pro-quality audio capture for screen recording.
 
-System audio: Native Objective-C helper using ScreenCaptureKit (macOS 13+)
-              Writes raw float32 stereo PCM to a temp file.
-              PyObjC ScreenCaptureKit audio bindings are broken on macOS 15,
-              so we use a compiled native helper binary instead.
-Microphone:   sounddevice (PortAudio)
+System audio:
+    macOS   Native Objective-C helper using ScreenCaptureKit (macOS 13+).
+            Writes raw float32 stereo PCM to a temp file. PyObjC's
+            ScreenCaptureKit audio bindings are broken on macOS 15, so a
+            compiled helper binary is used instead.
+    Windows WASAPI loopback of the default output device through the
+            `soundcard` package (what you hear = what gets recorded).
+            WASAPI loopback only delivers data while SOMETHING is playing,
+            so a silent keep-alive output stream runs alongside it and any
+            remaining gap is padded with zeros from the wall clock.
+Microphone: sounddevice (PortAudio) on every platform.
 
-Audio processing chain (OBS / ScreenFlow / Loom best practices):
-  Mic -> Noise gate -> Soft compression -> Mix with system audio
-      -> Limiter -> Peak normalize -> Stereo AAC
+Audio processing chain (Loom-style, deliberately simple - see CLAUDE.md):
+  Mic -> gentle compression -> mix with system audio at a fixed level
+      -> limiter -> one static normalize -> stereo AAC
 """
 import sys
 import os
 import time
-import signal as _signal
-import subprocess
-import select
 import threading
 import numpy as np
 
-if sys.platform != "darwin":
-    raise ImportError("audio_helper is macOS only")
+from platform_utils import IS_MACOS, IS_WINDOWS, recordings_dir
 
 SAMPLE_RATE = 48000  # industry standard for video (OBS default)
 
@@ -33,24 +35,70 @@ _HELPER_PATH = os.path.join(
 
 def _get_recordings_dir():
     """Writable dir for temp files (avoids /var/folders/ issues on macOS)."""
-    base = os.path.expanduser("~/Movies/ScreenCapture")
-    os.makedirs(base, exist_ok=True)
-    return base
+    return recordings_dir()
+
+
+def system_audio_available():
+    """Can this machine record what it plays? (Cheap check, no devices opened.)"""
+    if IS_MACOS:
+        return os.path.isfile(_HELPER_PATH)
+    if IS_WINDOWS:
+        try:
+            import soundcard  # noqa: F401
+            return True
+        except Exception:
+            return False
+    return False
 
 
 class SystemAudioCapture:
-    """Captures system audio via a native ScreenCaptureKit helper binary.
+    """Captures system audio (what the computer plays) as float32 stereo.
 
-    The helper writes raw float32 stereo PCM at 48 kHz to a temp file.
-    No PyObjC ScreenCaptureKit dependency — works reliably on macOS 15.
+    Dispatches to the macOS native helper or the Windows WASAPI loopback.
+    Raises RuntimeError from start() when the platform cannot do it, so the
+    recorder can carry on with mic-only audio.
     """
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
+        self.sample_rate = sample_rate
+        self._impl = None
+        if IS_MACOS:
+            self._impl = _MacSystemAudio(sample_rate)
+        elif IS_WINDOWS:
+            self._impl = _WindowsLoopbackAudio(sample_rate)
+
+    def start(self):
+        if self._impl is None:
+            raise RuntimeError("System audio capture is not supported on this platform")
+        self._impl.start()
+
+    def stop(self):
+        if self._impl is not None:
+            self._impl.stop()
+
+    def set_paused(self, paused: bool):
+        # Both backends record continuously; paused segments are removed in
+        # post-processing by remove_paused_segments().
+        if self._impl is not None and hasattr(self._impl, "set_paused"):
+            self._impl.set_paused(paused)
+
+    def get_audio_stereo(self):
+        if self._impl is None:
+            return np.zeros((0, 2), dtype=np.float32)
+        return self._impl.get_audio_stereo()
+
+
+class _MacSystemAudio:
+    """macOS: ScreenCaptureKit via the compiled sc_audio_helper binary."""
+
+    def __init__(self, sample_rate):
         self.sample_rate = sample_rate
         self._process = None
         self._output_path = None
 
     def start(self):
+        import subprocess
+        import select
         self._output_path = os.path.join(
             _get_recordings_dir(), f"_temp_sysaudio_{os.getpid()}_{int(time.time())}.raw"
         )
@@ -78,9 +126,7 @@ class SystemAudioCapture:
                     err = self._process.stderr.read().decode()
                 raise RuntimeError(f"sc_audio_helper exited early: {err}")
             if self._process.stderr:
-                rlist, _, _ = select.select(
-                    [self._process.stderr], [], [], 0.1
-                )
+                rlist, _, _ = select.select([self._process.stderr], [], [], 0.1)
                 if rlist:
                     line = self._process.stderr.readline().decode().strip()
                     if line == "READY":
@@ -94,6 +140,7 @@ class SystemAudioCapture:
         print("[audio] System audio capture started (native helper)")
 
     def stop(self):
+        import signal as _signal
         if self._process and self._process.poll() is None:
             self._process.send_signal(_signal.SIGTERM)
             try:
@@ -102,39 +149,150 @@ class SystemAudioCapture:
                 self._process.kill()
         self._process = None
 
-    def set_paused(self, paused: bool):
-        # The native helper records continuously; paused segments are
-        # removed in post-processing by remove_paused_segments().
-        pass
-
     def get_audio_stereo(self):
         """Read captured audio from the raw PCM file as float32 (N, 2)."""
         if not self._output_path or not os.path.isfile(self._output_path):
             return np.zeros((0, 2), dtype=np.float32)
-
         try:
             file_size = os.path.getsize(self._output_path)
             if file_size == 0:
                 print("[audio] System audio file is empty (0 bytes)")
                 return np.zeros((0, 2), dtype=np.float32)
-
             data = np.fromfile(self._output_path, dtype=np.float32)
-            print(f"[audio] System audio: {len(data)} float32 samples "
-                  f"({file_size} bytes)")
-
-            # Clean up temp file
+            print(f"[audio] System audio: {len(data)} float32 samples ({file_size} bytes)")
             try:
                 os.remove(self._output_path)
             except OSError:
                 pass
-
             if len(data) % 2 != 0:
                 data = data[:len(data) - 1]
-
             return data.reshape(-1, 2)
         except Exception as e:
             print(f"[audio] System audio read error: {e}")
             return np.zeros((0, 2), dtype=np.float32)
+
+
+class _WindowsLoopbackAudio:
+    """Windows: WASAPI loopback of the default speaker via `soundcard`.
+
+    Two things make this reliable:
+    1. A silent keep-alive output stream (sounddevice, blocking writes on a
+       thread) so the loopback endpoint always has an active session and
+       keeps delivering buffers even when no app is playing.
+    2. Wall-clock gap padding: chunks are time-stamped; if the loopback
+       still stalls (some drivers do), silence is inserted so the captured
+       stream stays the same length as real time and stays in sync with
+       the video.
+    """
+
+    BLOCK = 2048
+
+    def __init__(self, sample_rate):
+        self.sample_rate = sample_rate
+        self._chunks = []          # list of (t_arrival, ndarray (n, 2))
+        self._running = False
+        self._thread = None
+        self._keepalive_thread = None
+        self._start_time = None
+        self._error = None
+        self._ready = threading.Event()
+
+    def start(self):
+        try:
+            import soundcard  # noqa: F401
+        except Exception as e:
+            raise RuntimeError(f"soundcard package not available ({e}); "
+                               "pip install soundcard")
+        self._running = True
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, daemon=True, name="sc-sys-keepalive")
+        self._keepalive_thread.start()
+        self._thread = threading.Thread(
+            target=self._capture_loop, daemon=True, name="sc-sys-loopback")
+        self._thread.start()
+        # Give the loopback a moment to open; surface open errors early.
+        if not self._ready.wait(timeout=4.0):
+            self._running = False
+            raise RuntimeError(self._error or "WASAPI loopback did not start")
+        if self._error:
+            self._running = False
+            raise RuntimeError(self._error)
+        print("[audio] System audio capture started (WASAPI loopback)")
+
+    def _keepalive_loop(self):
+        """Play digital silence so the loopback session never goes idle."""
+        try:
+            import sounddevice as sd
+            zeros = np.zeros((self.BLOCK, 2), dtype=np.float32)
+            with sd.OutputStream(samplerate=self.sample_rate, channels=2,
+                                 dtype="float32", blocksize=self.BLOCK) as out:
+                while self._running:
+                    out.write(zeros)
+        except Exception as e:
+            # Not fatal: capture still works while other apps play sound.
+            print(f"[audio] keep-alive stream unavailable: {e}")
+
+    def _capture_loop(self):
+        try:
+            try:
+                import pythoncom  # pywin32: COM must be initialised per thread
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+            import soundcard as sc
+            spk = sc.default_speaker()
+            mic = sc.get_microphone(spk.name, include_loopback=True)
+            with mic.recorder(samplerate=self.sample_rate, channels=2,
+                              blocksize=self.BLOCK) as rec:
+                self._start_time = time.perf_counter()
+                self._ready.set()
+                while self._running:
+                    data = rec.record(numframes=self.BLOCK)
+                    if data is None or len(data) == 0:
+                        continue
+                    if data.ndim == 1:
+                        data = np.stack([data, data], axis=1)
+                    elif data.shape[1] == 1:
+                        data = np.repeat(data, 2, axis=1)
+                    self._chunks.append((time.perf_counter(), data.astype(np.float32, copy=True)))
+        except Exception as e:
+            self._error = f"loopback capture failed: {e}"
+            print(f"[audio] {self._error}")
+            self._ready.set()
+
+    def stop(self):
+        self._running = False
+        self._stop_time = time.perf_counter()
+        for t in (self._thread, self._keepalive_thread):
+            if t is not None:
+                t.join(timeout=2.5)
+        self._thread = None
+        self._keepalive_thread = None
+
+    def set_paused(self, paused: bool):
+        pass
+
+    def get_audio_stereo(self):
+        """Concatenate chunks, padding wall-clock gaps with silence."""
+        if not self._chunks or self._start_time is None:
+            return np.zeros((0, 2), dtype=np.float32)
+        sr = self.sample_rate
+        out = []
+        written = 0  # samples emitted so far
+        for t_arrival, chunk in self._chunks:
+            # Where should this chunk END according to the wall clock?
+            expected_end = int((t_arrival - self._start_time) * sr)
+            expected_start = expected_end - len(chunk)
+            gap = expected_start - written
+            # Only pad clearly stalled stretches (> 1 block); jitter is ignored.
+            if gap > self.BLOCK * 2:
+                out.append(np.zeros((gap, 2), dtype=np.float32))
+                written += gap
+            out.append(chunk)
+            written += len(chunk)
+        data = np.concatenate(out) if out else np.zeros((0, 2), dtype=np.float32)
+        print(f"[audio] System audio: {len(data)} frames ({len(self._chunks)} chunks)")
+        return data
 
 
 class MicCapture:
@@ -144,7 +302,8 @@ class MicCapture:
     The callback approach caused SIGSEGV in ffi_closure_SYSV_inner on
     macOS because PortAudio's CoreAudio IO thread invokes a cffi C
     function pointer that can become invalid during GC or teardown.
-    Blocking reads avoid the cffi closure entirely.
+    Blocking reads avoid the cffi closure entirely (and are just as good
+    on Windows).
     """
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
@@ -165,11 +324,11 @@ class MicCapture:
     def start(self):
         import sounddevice as sd
 
-        # Open stream WITHOUT a callback — use blocking reads instead.
+        # Open stream WITHOUT a callback - use blocking reads instead.
         # A roomy buffer + default ("high") latency is what keeps the audio
         # CLEAN: too small a buffer drops samples on any hiccup and you hear
-        # the voice cut out. Any small lip-sync delay is handled by the
-        # "Audio Sync" offset, not by starving the buffer.
+        # the voice cut out. Lip-sync is handled by start-time alignment in
+        # the recorder, not by starving the buffer.
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=1,
@@ -194,9 +353,7 @@ class MicCapture:
             try:
                 data, overflowed = self._stream.read(2048)
                 if self._paused or self._muted:
-                    self._chunks.append(
-                        np.zeros((len(data), 1), dtype=np.float32)
-                    )
+                    self._chunks.append(np.zeros((len(data), 1), dtype=np.float32))
                 else:
                     self._chunks.append(data.copy())
             except Exception:
@@ -218,38 +375,29 @@ class MicCapture:
             self._stream = None
 
     def get_audio_mono(self):
-        """Return captured audio as float32 numpy array shaped (N,).
-
-        Called after stop() — no concurrent access.
-        """
+        """Return captured audio as float32 numpy array shaped (N,)."""
         if not self._chunks:
             return np.array([], dtype=np.float32)
         return np.concatenate(self._chunks).flatten()
 
 
 # ---------------------------------------------------------------------------
-# Audio processing — what OBS / ScreenFlow / Loom apply under the hood
+# Audio processing - what OBS / ScreenFlow / Loom apply under the hood
 # ---------------------------------------------------------------------------
 
 def noise_gate(audio, threshold_db=-50, hold_ms=200, sample_rate=SAMPLE_RATE):
-    """Noise gate: attenuate blocks below threshold.
-
-    Conservative threshold and longer hold time to avoid chopping speech.
-    Only silences true background noise, not quiet speech.
-    """
+    """Noise gate: attenuate blocks below threshold (kept for reference; the
+    default mix does NOT use it - it clipped quiet word endings)."""
     if len(audio) == 0:
         return audio
-
     threshold = 10 ** (threshold_db / 20.0)
     block_size = int(sample_rate * hold_ms / 1000)
     out = audio.copy()
-
     for start in range(0, len(out), block_size):
         block = out[start:start + block_size]
         rms = np.sqrt(np.mean(block ** 2))
         if rms < threshold:
-            out[start:start + block_size] *= 0.05  # gentler attenuation
-
+            out[start:start + block_size] *= 0.05
     return out
 
 
@@ -257,20 +405,16 @@ def soft_compress(audio, threshold_db=-24, ratio=2.5, makeup_db=12):
     """Soft-knee compressor for voice: tames peaks, lifts quiet parts."""
     if len(audio) == 0:
         return audio
-
     threshold = 10 ** (threshold_db / 20.0)
     makeup = 10 ** (makeup_db / 20.0)
-
     out = audio.copy()
     abs_out = np.abs(out)
-
     mask = abs_out > threshold
     if np.any(mask):
         over_db = 20 * np.log10(abs_out[mask] / threshold + 1e-10)
         compressed_db = over_db / ratio
         gain = (threshold * 10 ** (compressed_db / 20.0)) / (abs_out[mask] + 1e-10)
         out[mask] *= gain
-
     out *= makeup
     return out
 
@@ -286,43 +430,10 @@ def peak_normalize(audio, target_db=-1.0):
     return audio * (target / peak)
 
 
-def _ducking_gain(mic_mono, sample_rate, duck_db=-14.0,
-                  threshold_db=-38.0, attack_ms=12.0, release_ms=320.0):
-    """Sidechain ducking gain for the SYSTEM audio (0..1 per sample).
-
-    Drops the system audio when the mic has voice so narration cuts through,
-    and smoothly returns to full when you stop talking — exactly what
-    Loom / ScreenFlow / OBS (sidechain compressor) do. Computed per 5 ms
-    block for speed, then upsampled to the audio rate.
-    """
-    n = len(mic_mono)
-    if n == 0:
-        return None
-    block = max(1, int(sample_rate * 0.005))          # 5 ms
-    thresh = 10 ** (threshold_db / 20.0)
-    duck = 10 ** (duck_db / 20.0)                      # e.g. -14 dB -> 0.20
-    nblocks = (n + block - 1) // block
-    # per-block RMS of the mic (voice detector)
-    pad = nblocks * block - n
-    mic_p = np.concatenate([mic_mono, np.zeros(pad, dtype=np.float32)]) if pad else mic_mono
-    rms = np.sqrt(np.mean(mic_p.reshape(nblocks, block) ** 2, axis=1) + 1e-12)
-    # attack/release one-pole smoothing on the gain
-    a_atk = np.exp(-1.0 / (sample_rate * (attack_ms / 1000.0) / block))
-    a_rel = np.exp(-1.0 / (sample_rate * (release_ms / 1000.0) / block))
-    gain = np.ones(nblocks, dtype=np.float32)
-    g = 1.0
-    for i in range(nblocks):
-        target = duck if rms[i] > thresh else 1.0
-        coeff = a_atk if target < g else a_rel       # fast to duck, slow to release
-        g = coeff * g + (1.0 - coeff) * target
-        gain[i] = g
-    return np.repeat(gain, block)[:n]
-
-
 def mix_and_master(system_stereo, mic_mono, sample_rate=SAMPLE_RATE):
     """Clean, Loom-style mix: voice forward over a steady-level background.
 
-    Deliberately simple — what keeps it clean:
+    Deliberately simple - what keeps it clean:
       - NO sidechain ducking (dynamic ducking pumps the volume up/down).
       - NO hard noise gate (it clips quiet word-endings -> "cuts").
       - Just: gentle mic compression for a consistent voice level, the system
@@ -332,9 +443,7 @@ def mix_and_master(system_stereo, mic_mono, sample_rate=SAMPLE_RATE):
     """
     SYSTEM_LEVEL = 0.45   # system audio sits steadily under the voice
     if len(mic_mono) > 0:
-        # Gentle compression evens out the voice without gating it.
-        mic_mono = soft_compress(mic_mono, threshold_db=-24, ratio=3.0,
-                                 makeup_db=10)
+        mic_mono = soft_compress(mic_mono, threshold_db=-24, ratio=3.0, makeup_db=10)
 
     sys_frames = len(system_stereo)
     mic_frames = len(mic_mono)
@@ -349,14 +458,13 @@ def mix_and_master(system_stereo, mic_mono, sample_rate=SAMPLE_RATE):
         out[:mic_frames, 0] += mic_mono[:mic_frames]
         out[:mic_frames, 1] += mic_mono[:mic_frames]
 
-    # Peak limiter (catch clipping) + one static normalize (loudness, no pump).
     out = _limiter_stereo(out, threshold_db=-1.0)
     out = _normalize_stereo(out, target_db=-1.0)
     return out
 
 
 def _limiter_stereo(stereo, threshold_db=-1.0):
-    """Hard limiter on stereo signal — prevents clipping."""
+    """Hard limiter on stereo signal - prevents clipping."""
     threshold = 10 ** (threshold_db / 20.0)
     return np.clip(stereo, -threshold, threshold)
 

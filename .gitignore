@@ -17,8 +17,9 @@ build/
 
 # IDE
 .idea/
-.vscode/
+# .vscode/settings.json is versioned on purpose (project standard)
 *.swp
+.venv-*/
 *.swo
 
 # OS

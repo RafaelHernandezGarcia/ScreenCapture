@@ -1,0 +1,10 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+    "python.analysis.extraPaths": ["."],
+    "cursorpyright.analysis.extraPaths": ["."],
+    "notebook.output.scrolling": true,
+    "notebook.output.textLineLimit": 50,
+    "files.exclude": {
+        "**/__pycache__": true
+    }
+}

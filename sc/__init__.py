@@ -1,4 +1,4 @@
-"""ScreenCapture — clean rewrite.
+"""ScreenCapture - clean rewrite.
 
 v1 surface:
 - sc.hotkey      Carbon RegisterEventHotKey wrapper (no Accessibility).

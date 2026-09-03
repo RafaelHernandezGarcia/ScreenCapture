@@ -1,4 +1,4 @@
-"""Pre-recording setup panel — Loom-style.
+"""Pre-recording setup panel - Loom-style.
 
 After you pick a region, this panel lets you calmly set things up: toggle the
 webcam (and drag the circle where you want it), toggle the mic, then press
@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QGraphicsDropShadowEffect,
 )
 
-SYSTEM_FONT = ".AppleSystemUIFont" if sys.platform == "darwin" else "Segoe UI"
+from platform_utils import SYSTEM_FONT, make_non_activating
 
 _CORAL = "#F24E2E"      # Loom-ish record color
 _CORAL_HOVER = "#D8401F"
@@ -54,6 +54,15 @@ def _icon(kind: str, color="#1D1D1F", size=22) -> QIcon:
     elif kind == "close":
         p.drawLine(int(6*s), int(6*s), int(18*s), int(18*s))
         p.drawLine(int(18*s), int(6*s), int(6*s), int(18*s))
+    elif kind == "speaker":
+        # Speaker box + cone, two sound arcs
+        path = QPainterPath()
+        path.moveTo(4*s, 9*s); path.lineTo(8*s, 9*s); path.lineTo(13*s, 5*s)
+        path.lineTo(13*s, 19*s); path.lineTo(8*s, 15*s); path.lineTo(4*s, 15*s)
+        path.closeSubpath()
+        p.drawPath(path)
+        p.drawArc(QRect(int(12*s), int(8*s), int(6*s), int(8*s)), -60 * 16, 120 * 16)
+        p.drawArc(QRect(int(13*s), int(5*s), int(9*s), int(14*s)), -60 * 16, 120 * 16)
     p.end()
     return QIcon(pm)
 
@@ -142,9 +151,10 @@ class SetupPanel(QWidget):
     cancel_clicked = pyqtSignal()
     webcam_toggled = pyqtSignal(bool)
     mic_toggled = pyqtSignal(bool)
+    system_audio_toggled = pyqtSignal(bool)
 
     def __init__(self, screen_geo: QRect, camera_name="Webcam", mic_name="Microphone",
-                 webcam_on=True, mic_on=True):
+                 webcam_on=True, mic_on=True, system_audio_on=None):
         super().__init__()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -153,6 +163,8 @@ class SetupPanel(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        make_non_activating(self)
+        self._drag_pos = None
 
         # Card container (so we can round it + shadow it inside a transparent window)
         card = QFrame(self)
@@ -202,6 +214,13 @@ class SetupPanel(QWidget):
         self._mic_row.toggle.toggled.connect(self.mic_toggled.emit)
         lay.addWidget(self._mic_row)
 
+        # Optional third row: record what the computer plays (system audio).
+        self._sys_row = None
+        if system_audio_on is not None:
+            self._sys_row = _Row("speaker", "Computer audio", system_audio_on)
+            self._sys_row.toggle.toggled.connect(self.system_audio_toggled.emit)
+            lay.addWidget(self._sys_row)
+
         lay.addSpacing(4)
         start = QPushButton("Start recording")
         start.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -228,6 +247,9 @@ class SetupPanel(QWidget):
     def mic_on(self):
         return self._mic_row.toggle.isChecked()
 
+    def system_audio_on(self):
+        return bool(self._sys_row and self._sys_row.toggle.isChecked())
+
     def showEvent(self, event):
         super().showEvent(event)
         if sys.platform == "darwin":
@@ -236,3 +258,15 @@ class SetupPanel(QWidget):
                 _configure_clickable_panel(self, level=25)
             except Exception:
                 pass
+
+    # The card can be dragged anywhere by its empty areas.
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.pos()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None:
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None

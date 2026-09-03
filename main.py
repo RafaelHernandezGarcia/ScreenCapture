@@ -1,16 +1,51 @@
 """
 ScreenCapture - Main Application Entry Point
-A LightShot-like screenshot tool for Windows and macOS
+A LightShot / Loom-style screenshot + screen recording tray app for
+Windows and macOS.
+
+Flow: global hotkey -> freeze the screen under the mouse -> OverlayWindow
+(select, annotate, copy / save / record) -> optional recording pipeline
+(SetupPanel -> CountdownOverlay -> ScreenRecorder + RecordingToolbar).
 """
 import sys
 import os
-import json
+import threading
 from typing import Optional
 
-IS_WINDOWS = sys.platform == "win32"
-IS_MACOS = sys.platform == "darwin"
+LOCK_PORT = int(os.environ.get("SCREENCAPTURE_LOCK_PORT", "47392"))
 
-# OpenCV camera auth on macOS — must be set before cv2 import
+
+def _send_command(cmd: str) -> bool:
+    """Talk to the running instance over the single-instance port.
+
+    `python main.py --quit`     asks the running copy to exit cleanly
+    `python main.py --capture`  triggers a screenshot in the running copy
+    Returns True if a running instance accepted the command. Pure sockets,
+    so this works before PyQt6 is imported (and from any Python).
+    """
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", LOCK_PORT), timeout=1.0) as s:
+            s.sendall(cmd.encode("ascii") + b"\n")
+            return True
+    except OSError:
+        return False
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] in ("--quit", "--capture"):
+    _ok = _send_command(sys.argv[1].lstrip("-"))
+    print(("sent" if _ok else "no running instance") + f" ({sys.argv[1]})")
+    raise SystemExit(0 if _ok else 1)
+
+from platform_utils import (
+    IS_WINDOWS, IS_MACOS, SYSTEM_FONT, BRAND_PURPLE, BRAND_PURPLE_SOFT,
+    INK, CARD_BORDER, physical_screen_rect, reveal_in_file_manager,
+    open_folder, recordings_dir, screenshots_dir, set_startup_enabled,
+    startup_enabled, force_foreground,
+)
+import app_config
+
+# OpenCV camera auth on macOS - must be set before cv2 import
 if IS_MACOS:
     os.environ.setdefault("OPENCV_AVFOUNDATION_SKIP_AUTH", "1")
 
@@ -20,7 +55,6 @@ if IS_MACOS:
         import AppKit
         info = AppKit.NSBundle.mainBundle().infoDictionary()
         info["LSUIElement"] = "1"
-        # Usage descriptions so the camera/mic permission prompts can appear.
         info.setdefault(
             "NSCameraUsageDescription",
             "ScreenCapture uses the camera for the webcam picture-in-picture "
@@ -33,12 +67,10 @@ if IS_MACOS:
     except Exception:
         pass
 
-# NOTE: this is the full LightShot-style Qt app (rich annotation overlay:
-# pen/line/arrow/rect/highlighter/text, color picker, undo, resize/move
-# handles, record/copy/save/close action bar). A leaner pure-PyObjC
+# NOTE: this is the full LightShot-style Qt app. A leaner pure-PyObjC
 # screenshot core also exists in sc/ (run `python -m sc`) but it does NOT
-# yet have the annotation toolbar, so the Qt app remains the default on
-# macOS. Set SCREENCAPTURE_USE_NATIVE=1 to opt into the native core.
+# have the annotation toolbar, so the Qt app remains the default on macOS.
+# Set SCREENCAPTURE_USE_NATIVE=1 to opt into the native core.
 if __name__ == "__main__" and IS_MACOS and os.environ.get("SCREENCAPTURE_USE_NATIVE") == "1":
     from sc.app import main as _native_main
     raise SystemExit(_native_main())
@@ -47,34 +79,25 @@ if IS_WINDOWS:
     import ctypes
     import ctypes.wintypes
 
-# --- Config ---
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# --- Config (shared store, see app_config.py) ---
+CONFIG_PATH = app_config.CONFIG_PATH
+load_config = app_config.load_config
+save_config = app_config.save_config
 
-def load_config():
-    try:
-        with open(CONFIG_PATH, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-# --- 1. THE NUCLEAR FIX: DISABLE ALL SCALING (Windows only) ---
-# We must set these BEFORE importing PyQt6.
-# This forces the app to run in 1:1 physical pixels, preventing the "Zoom" effect.
-if IS_WINDOWS:
+# --- Windows DPI ---
+# Default (windows_dpi_scaling = true): let Qt scale the UI to the monitor
+# (toolbars look right on a 150% laptop screen; mixed-DPI setups work) and
+# map logical <-> physical pixels ourselves via platform_utils.
+# Legacy (false): force 1:1 physical pixels, the behaviour of the first
+# Windows build. Keep as an escape hatch.
+if IS_WINDOWS and not app_config.get("windows_dpi_scaling", True):
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
     os.environ["QT_SCALE_FACTOR"] = "1"
     os.environ["QT_SCREEN_SCALE_FACTORS"] = "1"
-# -----------------------------------------------
-
-import threading
 
 from PyQt6.QtCore import Qt, QRect, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QIcon, QAction, QCursor, QGuiApplication, QKeySequence
+from PyQt6.QtGui import QIcon, QAction, QCursor, QGuiApplication, QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QMessageBox,
     QDialog, QVBoxLayout, QLabel, QPushButton, QHBoxLayout
@@ -90,120 +113,165 @@ from recording_toolbar import RecordingToolbar, DrawingSubPanel
 from webcam import WebcamCapture, WebcamPreviewWidget, list_cameras
 from countdown import CountdownOverlay
 
+APP_NAME = "ScreenCapture"
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
-def _prepare_overlay_window(widget):
-    """Realize a Qt widget's underlying NSWindow and configure it for
-    macOS before the first show().
 
-    - CanJoinAllSpaces + Stationary + Transient before show:
-      prevents macOS from switching to the app's "home" Space and
-      revealing the desktop wallpaper.
-    - NSWindowStyleMaskNonactivatingPanel: lets the panel become the
-      key window (and receive keyDown events like Cmd+C / Esc) WITHOUT
-      activating the app, so we don't have to choose between "Space
-      stays put" and "keyboard shortcuts work".
+# ---------------------------------------------------------------------------
+# Hotkey name parsing (shared by the dialog and both platform backends)
+# ---------------------------------------------------------------------------
+
+# Windows virtual-key codes for the keys we let people pick.
+_WIN_VK = {
+    "PRINT": 0x2C, "PRINTSCREEN": 0x2C, "SYSREQ": 0x2C,
+    "PAUSE": 0x13, "SCROLLLOCK": 0x91, "NUMLOCK": 0x90,
+    "INSERT": 0x2D, "INS": 0x2D, "HOME": 0x24, "END": 0x23,
+    "PGUP": 0x21, "PAGEUP": 0x21, "PGDOWN": 0x22, "PAGEDOWN": 0x22,
+    "DEL": 0x2E, "DELETE": 0x2E, "SPACE": 0x20, "TAB": 0x09,
+    "BACKSPACE": 0x08, "ENTER": 0x0D, "RETURN": 0x0D,
+}
+for _i in range(1, 25):
+    _WIN_VK[f"F{_i}"] = 0x70 + _i - 1
+for _c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    _WIN_VK[_c] = ord(_c)
+for _d in "0123456789":
+    _WIN_VK[_d] = ord(_d)
+
+_MOD_ALIASES = {
+    "CTRL": "Ctrl", "CONTROL": "Ctrl", "SHIFT": "Shift", "ALT": "Alt",
+    "OPTION": "Alt", "META": "Meta", "WIN": "Meta", "WINDOWS": "Meta",
+    "CMD": "Meta", "COMMAND": "Meta", "SUPER": "Meta",
+}
+
+
+def parse_hotkey(name: str):
+    """'Ctrl+Shift+S' -> (['Ctrl', 'Shift'], 'S'). Key is upper-cased, spaces removed."""
+    parts = [p.strip() for p in str(name or "").replace(" ", "").split("+") if p.strip()]
+    if not parts:
+        return [], ""
+    mods = []
+    for p in parts[:-1]:
+        m = _MOD_ALIASES.get(p.upper())
+        if m and m not in mods:
+            mods.append(m)
+    key = parts[-1].upper()
+    if key == "PRINT SCREEN" or key == "PRINTSCREEN":
+        key = "PRINT"
+    return mods, key
+
+
+def pretty_hotkey(name: str) -> str:
+    """Human label, e.g. 'PrintScreen', 'Ctrl+Shift+S'."""
+    mods, key = parse_hotkey(name)
+    label = {"PRINT": "PrintScreen", "SCROLLLOCK": "Scroll Lock",
+             "PGUP": "Page Up", "PGDOWN": "Page Down"}.get(key, key.title() if len(key) > 1 else key)
+    if IS_MACOS:
+        # Qt records Command as "Ctrl" and Control as "Meta" on macOS
+        mods = [{"Ctrl": "Cmd", "Meta": "Ctrl"}.get(m, m) for m in mods]
+    else:
+        mods = ["Win" if m == "Meta" else m for m in mods]
+    return "+".join(mods + [label])
+
+
+class WindowsHotkey:
+    """Process-global hotkey on Windows via RegisterHotKey.
+
+    The hotkey must be registered on the thread that pumps its messages, so
+    a small daemon thread owns it. re-register() posts WM_QUIT to that
+    thread first so the previous key is released (the earlier build leaked
+    the old registration every time the shortcut was changed).
     """
-    if not IS_MACOS:
-        return
-    try:
-        import ctypes as _ct
-        import objc
-        from AppKit import (
-            NSWindowCollectionBehaviorCanJoinAllSpaces,
-            NSWindowCollectionBehaviorStationary,
-            NSWindowCollectionBehaviorIgnoresCycle,
-            NSWindowCollectionBehaviorFullScreenAuxiliary,
-            NSWindowCollectionBehaviorTransient,
-            NSWindowStyleMaskNonactivatingPanel,
-        )
-        widget.create()  # force Qt to instantiate the NSView + NSWindow
-        ptr = int(widget.winId())
-        if ptr == 0:
-            return
-        nsview = objc.objc_object(c_void_p=_ct.c_void_p(ptr))
-        nswindow = nsview.window()
-        if nswindow is None:
-            return
-        nswindow.setLevel_(25)  # above normal windows, below menu bar
-        nswindow.setHidesOnDeactivate_(False)
-        nswindow.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorStationary
-            | NSWindowCollectionBehaviorIgnoresCycle
-            | NSWindowCollectionBehaviorFullScreenAuxiliary
-            | NSWindowCollectionBehaviorTransient
-        )
-        # Qt.Tool already makes this an NSPanel on macOS. Adding the
-        # non-activating mask lets it become key without NSApp.activate.
-        try:
-            current_mask = int(nswindow.styleMask())
-            nswindow.setStyleMask_(
-                current_mask | NSWindowStyleMaskNonactivatingPanel
-            )
-        except Exception:
-            pass
-    except Exception as e:
-        print(f"_prepare_overlay_window: {e}")
+    MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
+    WM_HOTKEY, WM_QUIT, PM_NOREMOVE = 0x0312, 0x0012, 0x0000
+    HOTKEY_ID = 1
 
+    def __init__(self, on_press):
+        self._on_press = on_press
+        self._thread = None
+        self._thread_id = None
+        self.last_error = ""
 
-def _make_key_without_activating(widget):
-    """Give the overlay full keyboard focus.
+    def register(self, name: str) -> bool:
+        self.unregister()
+        mods, key = parse_hotkey(name)
+        vk = _WIN_VK.get(key)
+        if vk is None:
+            self.last_error = f"Unsupported key: {key}"
+            return False
+        mod_flags = self.MOD_NOREPEAT
+        for m in mods:
+            mod_flags |= {"Ctrl": self.MOD_CONTROL, "Shift": self.MOD_SHIFT,
+                          "Alt": self.MOD_ALT, "Meta": self.MOD_WIN}[m]
 
-    We ALSO activate the app (NSApp.activateIgnoringOtherApps) — that's
-    what actually makes Qt dispatch keyDown events to the widget's
-    keyPressEvent. The Spaces-switch bug we feared from activation
-    doesn't happen anymore because _prepare_overlay_window already set
-    CanJoinAllSpaces on the NSWindow BEFORE show — the overlay exists
-    on every Space, so macOS never switches to find it.
-    """
-    if not IS_MACOS:
-        return
-    try:
-        import ctypes as _ct
-        import objc
-        from AppKit import NSApp
-        ptr = int(widget.winId())
-        if ptr == 0:
-            widget.activateWindow()
-            widget.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
-            return
-        nsview = objc.objc_object(c_void_p=_ct.c_void_p(ptr))
-        nswindow = nsview.window()
-        if nswindow is not None:
-            nswindow.makeKeyAndOrderFront_(None)
-        # Activate the app so Qt's keyboard dispatch works. Safe here
-        # because the overlay has CanJoinAllSpaces set — macOS has
-        # nowhere to switch to; the window is already on every Space.
-        try:
-            NSApp.activateIgnoringOtherApps_(True)
-        except Exception:
-            pass
-        widget.activateWindow()
-        widget.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
-    except Exception as e:
-        print(f"_make_key_without_activating: {e}")
-        widget.activateWindow()
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        ready = threading.Event()
+        result = {}
+
+        def _loop():
+            self._thread_id = kernel32.GetCurrentThreadId()
+            msg = ctypes.wintypes.MSG()
+            # Force-create this thread's message queue so PostThreadMessage works.
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, self.PM_NOREMOVE)
+            ok = user32.RegisterHotKey(None, self.HOTKEY_ID, mod_flags, vk)
+            result["ok"] = bool(ok)
+            if not ok:
+                result["err"] = kernel32.GetLastError()
+            ready.set()
+            if not ok:
+                return
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == self.WM_HOTKEY and msg.wParam == self.HOTKEY_ID:
+                    try:
+                        self._on_press()
+                    except Exception as e:
+                        print(f"[hotkey] callback error: {e}")
+            user32.UnregisterHotKey(None, self.HOTKEY_ID)
+
+        self._thread = threading.Thread(target=_loop, daemon=True, name="sc-hotkey")
+        self._thread.start()
+        ready.wait(timeout=3)
+        if not result.get("ok"):
+            err = result.get("err", "?")
+            self.last_error = (f"Could not register {pretty_hotkey(name)} (error {err}). "
+                               "Another app may already use it.")
+            self._thread = None
+            return False
+        print(f"[hotkey] {pretty_hotkey(name)} registered")
+        return True
+
+    def unregister(self):
+        if self._thread is not None and self._thread_id:
+            try:
+                ctypes.windll.user32.PostThreadMessageW(self._thread_id, self.WM_QUIT, 0, 0)
+                self._thread.join(timeout=2)
+            except Exception:
+                pass
+        self._thread = None
+        self._thread_id = None
 
 
 class HotkeyDialog(QDialog):
-    """Dialog to record a new hotkey"""
-    def __init__(self, current_key_name="PrintScreen", parent=None):
+    """Dialog to record a new hotkey (modifiers allowed: Ctrl+Shift+S, Win+F9...)."""
+
+    def __init__(self, current_key_name="Print", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Set Hotkey")
+        self.setWindowTitle("Set capture shortcut")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
-        self.setFixedSize(320, 140)
-        self.recorded_key = None
+        self.setFixedSize(360, 170)
         self.recorded_key_name = None
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
+        layout.setContentsMargins(20, 18, 20, 16)
 
-        self.label = QLabel(f"Current hotkey: <b>{current_key_name}</b>")
+        self.label = QLabel(f"Current shortcut: <b>{pretty_hotkey(current_key_name)}</b>")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.label)
 
-        self.instruction = QLabel("Press any key to set as the new hotkey...")
+        self.instruction = QLabel("Press the key (or key combination) you want to use...")
         self.instruction.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.instruction.setWordWrap(True)
         self.instruction.setStyleSheet("color: #666; font-style: italic;")
         layout.addWidget(self.instruction)
 
@@ -213,21 +281,31 @@ class HotkeyDialog(QDialog):
         btn_layout.addStretch()
         btn_layout.addWidget(cancel_btn)
         layout.addLayout(btn_layout)
-
         self.setFocus()
 
     def keyPressEvent(self, event):
         key = event.key()
-        # Ignore bare modifier keys
-        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta,
+                   Qt.Key.Key_unknown):
             return
-        key_name = QKeySequence(key).toString()
-        if key_name:
-            self.recorded_key = key
-            self.recorded_key_name = key_name
-            self.instruction.setText(f"Selected: <b>{key_name}</b>")
-            self.instruction.setStyleSheet("color: #007700; font-weight: bold;")
-            QTimer.singleShot(400, self.accept)
+        if key == Qt.Key.Key_Escape:
+            self.reject()
+            return
+        mods = event.modifiers()
+        seq = QKeySequence(int(mods.value) | key).toString()
+        if not seq:
+            return
+        # Normalise Qt spellings to our parser's vocabulary
+        seq = seq.replace("Print Screen", "Print").replace("ScrollLock", "Scroll Lock")
+        mods_list, k = parse_hotkey(seq)
+        if IS_WINDOWS and k not in _WIN_VK:
+            self.instruction.setText(f"'{seq}' cannot be used as a global shortcut. Try another key.")
+            self.instruction.setStyleSheet("color: #b00020;")
+            return
+        self.recorded_key_name = "+".join(mods_list + [k if len(k) > 1 else k])
+        self.instruction.setText(f"Selected: <b>{pretty_hotkey(self.recorded_key_name)}</b>")
+        self.instruction.setStyleSheet("color: #007700; font-weight: bold;")
+        QTimer.singleShot(400, self.accept)
 
 
 class SignalEmitter(QObject):
@@ -236,19 +314,65 @@ class SignalEmitter(QObject):
     camera_result = pyqtSignal(bool)  # camera permission grant result
 
 
+def _menu_stylesheet():
+    """Clean, modern tray menu on Windows (Qt's default looks dated there)."""
+    if not IS_WINDOWS:
+        return ""
+    return f"""
+        QMenu {{
+            background: #FFFFFF;
+            border: 1px solid {CARD_BORDER};
+            padding: 6px;
+            font-family: '{SYSTEM_FONT}';
+            font-size: 13px;
+            color: {INK};
+        }}
+        QMenu::item {{
+            padding: 7px 30px 7px 12px;
+            border-radius: 6px;
+        }}
+        QMenu::item:selected {{
+            background: {BRAND_PURPLE_SOFT};
+            color: {BRAND_PURPLE};
+        }}
+        QMenu::item:disabled {{
+            color: #9A9AA0;
+        }}
+        QMenu::separator {{
+            height: 1px;
+            background: {CARD_BORDER};
+            margin: 6px 8px;
+        }}
+        QMenu::indicator {{
+            width: 14px; height: 14px; margin-left: 6px;
+        }}
+        QMenu::right-arrow {{
+            margin-right: 8px;
+        }}
+    """
+
+
 class ScreenCaptureApp:
     """Main application class managing the screenshot tool"""
-    
+
     def __init__(self):
-        # Prevent any leftover scaling attributes (Windows only)
-        if IS_WINDOWS and hasattr(Qt.ApplicationAttribute, 'AA_DisableHighDpiScaling'):
+        # Legacy 1:1 mode only (Qt6 ignores the attribute otherwise)
+        if IS_WINDOWS and not app_config.get("windows_dpi_scaling", True) \
+                and hasattr(Qt.ApplicationAttribute, 'AA_DisableHighDpiScaling'):
             QApplication.setAttribute(Qt.ApplicationAttribute.AA_DisableHighDpiScaling, True)
 
         self.app = QApplication(sys.argv)
+        self.app.setApplicationName(APP_NAME)
+        self.app.setOrganizationName(APP_NAME)
         self.app.setQuitOnLastWindowClosed(False)
+        if IS_WINDOWS:
+            # Taskbar / toast identity: shows "ScreenCapture", not "Python".
+            try:
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RMScience.ScreenCapture")
+            except Exception:
+                pass
 
-        # Pin NSApp to Accessory so macOS treats us as a menu-bar
-        # utility: no Dock icon, no Space switch on activation.
+        # Pin NSApp to Accessory so macOS treats us as a menu-bar utility.
         if IS_MACOS:
             try:
                 import AppKit
@@ -258,7 +382,8 @@ class ScreenCaptureApp:
                 pass
 
         self.overlay: Optional[OverlayWindow] = None
-        self._hotkey_listener = None
+        self._win_hotkey: Optional[WindowsHotkey] = None
+        self._hotkey_mgr = None  # macOS Carbon manager
 
         # Recording state
         self._recorder: Optional[ScreenRecorder] = None
@@ -266,122 +391,203 @@ class ScreenCaptureApp:
         self._toolbar: Optional[RecordingToolbar] = None
         self._draw_panel: Optional[DrawingSubPanel] = None
         self._countdown: Optional[CountdownOverlay] = None
-        self._setup_panel = None  # pre-recording Loom-style setup card
+        self._setup_panel = None
         self._is_recording = False
         self._last_screen_geo: Optional[QRect] = None
         self._last_capture_dpr: float = 1.0
+        self._last_phys_origin = (0, 0)
         self._pending_record_region: Optional[dict] = None
         self._pending_logical_rect: Optional[QRect] = None
         self._recording_frame: Optional[RecordingFrame] = None
         self._webcam: Optional[WebcamCapture] = None
         self._webcam_preview: Optional[WebcamPreviewWidget] = None
         self._annotation_overlay: Optional[RecordingAnnotationOverlay] = None
+        self._last_notified_path: Optional[str] = None
 
-        # Webcam camera selection
         self._camera_index = 0
-        self._available_cameras = []  # populated on first webcam toggle
+        self._available_cameras = []
 
-        # Load saved hotkey config
         self.config = load_config()
         self.hotkey_name = self.config.get("hotkey_name", "Print")
         self._camera_index = self.config.get("camera_index", 0)
 
-        # Signal emitter for thread-safe capture triggering
         self.signal_emitter = SignalEmitter()
         self.signal_emitter.capture_requested.connect(self.start_capture)
         self.signal_emitter.camera_result.connect(self._on_camera_result)
 
         self._setup_tray()
         self._setup_hotkey()
-    
+        self._setup_control_channel()
+
+    # ------------------------------------------------------- control channel
+
+    def _setup_control_channel(self):
+        """Accept 'quit' / 'capture' commands on the single-instance socket
+        (see _send_command). Polled from the Qt loop; no extra thread."""
+        self._control_sock = _lock_socket
+        if self._control_sock is None:
+            return
+        try:
+            self._control_sock.listen(2)
+            self._control_sock.setblocking(False)
+        except OSError:
+            return
+        self._control_timer = QTimer()
+        self._control_timer.timeout.connect(self._poll_control_channel)
+        self._control_timer.start(400)
+
+    def _poll_control_channel(self):
+        try:
+            conn, _ = self._control_sock.accept()
+        except (BlockingIOError, OSError):
+            return
+        try:
+            conn.settimeout(0.5)
+            data = conn.recv(64).decode("ascii", errors="ignore").strip().lower()
+        except OSError:
+            data = ""
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if data == "quit":
+            print("[control] quit requested")
+            self._quit()
+        elif data == "capture":
+            self.start_capture()
+
+    # ------------------------------------------------------------------ tray
+
+    def _app_icon(self) -> QIcon:
+        for name in (("icon.ico",) if IS_WINDOWS else ("icon_tray.png", "icon.png")):
+            p = os.path.join(ASSETS_DIR, name)
+            if os.path.exists(p):
+                return QIcon(p)
+        p = os.path.join(ASSETS_DIR, "icon.png")
+        if os.path.exists(p):
+            return QIcon(p)
+        return self.app.style().standardIcon(self.app.style().StandardPixmap.SP_ComputerIcon)
+
     def _setup_tray(self):
-        """Set up the menu-bar icon and menu.
-
-        On macOS the visible icon + menu come from a native NSStatusItem
-        (QSystemTrayIcon doesn't render for LSUIElement apps launched via
-        LaunchServices). A hidden QSystemTrayIcon is still created for its
-        showMessage() balloon notifications.
-        """
-        base_dir = os.path.dirname(__file__)
-        tray_icon_path = os.path.join(base_dir, "assets", "icon_tray.png")
-        icon_path = os.path.join(base_dir, "assets", "icon.png")
-
+        """System tray / menu-bar icon and its menu."""
         self.tray = QSystemTrayIcon()
-        if os.path.exists(tray_icon_path):
-            self.tray.setIcon(QIcon(tray_icon_path))
-        elif os.path.exists(icon_path):
-            self.tray.setIcon(QIcon(icon_path))
-        else:
-            self.tray.setIcon(self.app.style().standardIcon(
-                self.app.style().StandardPixmap.SP_ComputerIcon
-            ))
-        self.tray.setToolTip(f"ScreenCapture - Press {self.hotkey_name} to capture")
+        self.tray.setIcon(self._app_icon())
+        self.tray.setToolTip(f"{APP_NAME} - press {pretty_hotkey(self.hotkey_name)} to capture")
 
-        # Qt context menu — used on Windows. On macOS the native menu mirrors it.
         menu = QMenu()
-        capture_action = QAction("New Screenshot", menu)
-        capture_action.triggered.connect(self.start_capture)
-        menu.addAction(capture_action)
+        menu.setStyleSheet(_menu_stylesheet())
+        self._menu = menu
+
+        self.capture_action = QAction("Take Screenshot", menu)
+        self.capture_action.triggered.connect(self.start_capture)
+        menu.addAction(self.capture_action)
         self._stop_recording_action = QAction("Stop Recording", menu)
         self._stop_recording_action.triggered.connect(self._stop_recording)
         self._stop_recording_action.setVisible(False)
         menu.addAction(self._stop_recording_action)
         menu.addSeparator()
 
-        # Settings group
-        self.hotkey_menu_action = QAction(
-            f"Capture Shortcut:  {self.hotkey_name}", menu)
+        # Settings
+        self.hotkey_menu_action = QAction(f"Capture Shortcut:  {pretty_hotkey(self.hotkey_name)}", menu)
         self.hotkey_menu_action.triggered.connect(self._change_hotkey)
         menu.addAction(self.hotkey_menu_action)
+
         self._camera_menu = QMenu("Webcam", menu)
+        self._camera_menu.setStyleSheet(_menu_stylesheet())
         self._camera_menu.aboutToShow.connect(self._populate_camera_menu)
         menu.addMenu(self._camera_menu)
+
         self._rec_size_menu = QMenu("Recording Quality", menu)
+        self._rec_size_menu.setStyleSheet(_menu_stylesheet())
         self._rec_size_menu.aboutToShow.connect(self._populate_rec_size_menu)
         menu.addMenu(self._rec_size_menu)
+
+        self._sys_audio_action = QAction("Record Computer Audio", menu)
+        self._sys_audio_action.setCheckable(True)
+        self._sys_audio_action.setChecked(bool(self.config.get("system_audio", True)))
+        self._sys_audio_action.toggled.connect(lambda on: self._set_bool("system_audio", on))
+        try:
+            from audio_helper import system_audio_available
+            if not system_audio_available():
+                self._sys_audio_action.setEnabled(False)
+                self._sys_audio_action.setText("Record Computer Audio (unavailable)")
+        except Exception:
+            pass
+        menu.addAction(self._sys_audio_action)
+
+        self._cursor_action = QAction("Show Mouse Cursor in Recordings", menu)
+        self._cursor_action.setCheckable(True)
+        self._cursor_action.setChecked(bool(self.config.get("show_cursor", True)))
+        self._cursor_action.toggled.connect(lambda on: self._set_bool("show_cursor", on))
+        menu.addAction(self._cursor_action)
+
+        if IS_WINDOWS:
+            self._startup_action = QAction("Start with Windows", menu)
+            self._startup_action.setCheckable(True)
+            self._startup_action.setChecked(startup_enabled())
+            self._startup_action.toggled.connect(self._toggle_startup)
+            menu.addAction(self._startup_action)
         menu.addSeparator()
 
         open_recordings_action = QAction("Open Recordings Folder", menu)
-        open_recordings_action.triggered.connect(self._open_recordings_folder)
+        open_recordings_action.triggered.connect(lambda: open_folder(get_recordings_dir()))
         menu.addAction(open_recordings_action)
-        about_action = QAction("About ScreenCapture", menu)
+        open_shots_action = QAction("Open Screenshots Folder", menu)
+        open_shots_action.triggered.connect(lambda: open_folder(screenshots_dir()))
+        menu.addAction(open_shots_action)
+        about_action = QAction(f"About {APP_NAME}", menu)
         about_action.triggered.connect(self._show_about)
         menu.addAction(about_action)
         menu.addSeparator()
-        quit_action = QAction("Quit ScreenCapture", menu)
+        quit_action = QAction(f"Quit {APP_NAME}", menu)
         quit_action.triggered.connect(self._quit)
         menu.addAction(quit_action)
+
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_tray_activated)
+        self.tray.messageClicked.connect(self._on_notification_clicked)
         self.tray.show()
 
-        # NOTE: QSystemTrayIcon renders correctly when the app is launched
-        # in the user's GUI session (LaunchAgent / shell), which is how this
-        # app is meant to start. It does NOT render when launched through a
-        # bash-script .app launcher via LaunchServices — that's why the app
-        # installs a LaunchAgent (see install) instead of relying on a
-        # double-clickable bundle. These attrs stay None (the optional native
-        # NSStatusItem path in mac_tray.py is unused now).
+        # Native NSStatusItem path (mac_tray.py) is unused; keep attrs for compat.
         self._mac_tray = None
         self._stop_item = None
         self._hotkey_item = None
 
-    def _build_camera_submenu(self, submenu):
-        """Populate the native Camera submenu (rebuilt each time it opens)."""
-        submenu.clear()
+    def _set_bool(self, key, value):
+        self.config[key] = bool(value)
+        save_config(self.config)
+
+    def _toggle_startup(self, on: bool):
+        exe = sys.executable
+        if IS_WINDOWS and exe.lower().endswith("python.exe"):
+            candidate = exe[:-len("python.exe")] + "pythonw.exe"
+            if os.path.exists(candidate):
+                exe = candidate
+        main_py = os.path.abspath(__file__)
+        ok = set_startup_enabled(
+            on, exe, f'"{main_py}"', os.path.dirname(main_py),
+            icon_path=os.path.join(ASSETS_DIR, "icon.ico"),
+        )
+        if not ok:
+            self._notify("Could not change the startup setting.", critical=True)
+            self._startup_action.blockSignals(True)
+            self._startup_action.setChecked(startup_enabled())
+            self._startup_action.blockSignals(False)
+
+    def _notify(self, text, title=APP_NAME, ms=3000, critical=False, path=None):
+        """Tray balloon. If `path` is given, clicking the balloon reveals it."""
+        self._last_notified_path = path
+        icon = (QSystemTrayIcon.MessageIcon.Critical if critical
+                else QSystemTrayIcon.MessageIcon.Information)
         try:
-            self._available_cameras = list_cameras()
+            self.tray.showMessage(title, text, icon, ms)
         except Exception:
-            self._available_cameras = []
-        if not self._available_cameras:
-            submenu.add_item("No cameras detected", None, enabled=False)
-            return
-        for idx, name in self._available_cameras:
-            submenu.add_item(
-                name,
-                lambda i=idx, n=name: self._select_camera(i, n),
-                checked=(idx == self._camera_index),
-            )
+            pass
+
+    def _on_notification_clicked(self):
+        if self._last_notified_path:
+            reveal_in_file_manager(self._last_notified_path)
 
     def _populate_rec_size_menu(self):
         """Choose the recorded video resolution."""
@@ -402,25 +608,20 @@ class ScreenCaptureApp:
     def _set_rec_size(self, key: str):
         self.config["recording_size"] = key
         save_config(self.config)
-        self.tray.showMessage(
-            "ScreenCapture",
-            f"Recording size: {key} — applies to your next recording.",
-            QSystemTrayIcon.MessageIcon.Information, 2500,
-        )
+        self._notify(f"Recording size: {key} - applies to your next recording.", ms=2500)
 
     def _set_stop_visible(self, visible: bool):
-        """Show/hide the Stop Recording item in whichever menu is active."""
         if getattr(self, "_stop_recording_action", None) is not None:
             self._stop_recording_action.setVisible(visible)
-        if getattr(self, "_stop_item", None) is not None:
-            self._stop_item.set_hidden(not visible)
+        if getattr(self, "capture_action", None) is not None:
+            self.capture_action.setEnabled(not visible)
 
     def _set_hotkey_label(self, text: str):
         if getattr(self, "hotkey_menu_action", None) is not None:
             self.hotkey_menu_action.setText(text)
-        if getattr(self, "_hotkey_item", None) is not None:
-            self._hotkey_item.set_title(text)
-    
+
+    # --------------------------------------------------------------- hotkey
+
     def _setup_hotkey(self):
         """Register global hotkey based on config"""
         try:
@@ -432,52 +633,26 @@ class ScreenCaptureApp:
             print(f"Warning: Could not register hotkey: {e}")
 
     def _setup_hotkey_windows(self):
-        """Register hotkey using Windows native API"""
-        MOD_NOREPEAT = 0x4000
-        WM_HOTKEY = 0x0312
-        HOTKEY_ID = 1
-
-        # Map Qt key name to Windows virtual key code
-        VK_MAP = {
-            "Print": 0x2C, "F1": 0x70, "F2": 0x71, "F3": 0x72, "F4": 0x73,
-            "F5": 0x74, "F6": 0x75, "F7": 0x76, "F8": 0x77, "F9": 0x78,
-            "F10": 0x79, "F11": 0x7A, "F12": 0x7B,
-            "F13": 0x7C, "F14": 0x7D, "F15": 0x7E, "F16": 0x7F,
-            "Pause": 0x13, "Scroll Lock": 0x91, "Insert": 0x2D, "Home": 0x24,
-        }
-        vk_code = VK_MAP.get(self.hotkey_name, 0x2C)
-
-        user32 = ctypes.windll.user32
-
-        def hotkey_thread():
-            if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_NOREPEAT, vk_code):
-                print(f"Warning: Could not register hotkey, error code: {ctypes.windll.kernel32.GetLastError()}")
-                return
-
-            print(f"{self.hotkey_name} hotkey registered successfully!")
-
-            msg = ctypes.wintypes.MSG()
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
-                    self.signal_emitter.capture_requested.emit()
-
-            user32.UnregisterHotKey(None, HOTKEY_ID)
-
-        self.hotkey_thread = threading.Thread(target=hotkey_thread, daemon=True)
-        self.hotkey_thread.start()
+        if self._win_hotkey is None:
+            self._win_hotkey = WindowsHotkey(lambda: self.signal_emitter.capture_requested.emit())
+        if not self._win_hotkey.register(self.hotkey_name):
+            self._notify(self._win_hotkey.last_error +
+                         " Pick another one under Capture Shortcut.", ms=6000, critical=True)
 
     def _setup_hotkey_macos(self):
-        """Register hotkey using Carbon RegisterEventHotKey.
-
-        No Accessibility permission needed (Carbon registers with the
-        WindowServer directly). Grants survive app rebuilds — they're
-        process-scoped, not TCC-gated.
-        """
-        from sc.hotkey import HotkeyManager, VK
-        vk = VK.get(self.hotkey_name, 105)  # default F13 / Print
+        """Register hotkey using Carbon RegisterEventHotKey (no Accessibility needed)."""
+        from sc.hotkey import HotkeyManager, VK, CMD_KEY, SHIFT_KEY, OPTION_KEY, CONTROL_KEY
+        mods, key = parse_hotkey(self.hotkey_name)
+        vk = VK.get(key.capitalize(), 105)  # "F13" -> "F13", "PRINT" -> "Print"; default F13
+        # Qt swaps Ctrl/Cmd on macOS: the dialog records Command as "Ctrl"
+        # and physical Control as "Meta".
+        carbon_mods = 0
+        for m in mods:
+            carbon_mods |= {"Ctrl": CMD_KEY, "Shift": SHIFT_KEY,
+                            "Alt": OPTION_KEY, "Meta": CONTROL_KEY}[m]
         self._hotkey_mgr = HotkeyManager()
         self._hotkey_mgr.register(
-            vk=vk, modifiers=0,
+            vk=vk, modifiers=carbon_mods,
             on_press=lambda: self.signal_emitter.capture_requested.emit(),
             signature="scrn",
         )
@@ -486,27 +661,28 @@ class ScreenCaptureApp:
         """Show dialog to change the hotkey"""
         dlg = HotkeyDialog(self.hotkey_name)
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.recorded_key_name:
+            previous = self.hotkey_name
             self.hotkey_name = dlg.recorded_key_name
-            self.config["hotkey_name"] = self.hotkey_name
-            save_config(self.config)
 
-            # Update UI
-            self._set_hotkey_label(f"Capture Shortcut:  {self.hotkey_name}")
-            self.tray.setToolTip(f"ScreenCapture - Press {self.hotkey_name} to capture")
-
-            # Restart hotkey listener
-            if IS_MACOS and getattr(self, "_hotkey_mgr", None) is not None:
+            if IS_MACOS and self._hotkey_mgr is not None:
                 self._hotkey_mgr.unregister_all()
                 self._hotkey_mgr = None
-            self._setup_hotkey()
+                self._setup_hotkey()
+            elif IS_WINDOWS:
+                if not self._win_hotkey.register(self.hotkey_name):
+                    self._notify(self._win_hotkey.last_error, ms=5000, critical=True)
+                    self.hotkey_name = previous
+                    self._win_hotkey.register(self.hotkey_name)
+                    return
 
-            self.tray.showMessage(
-                "ScreenCapture",
-                f"Hotkey changed to {self.hotkey_name}",
-                QSystemTrayIcon.MessageIcon.Information,
-                2000
-            )
-    
+            self.config["hotkey_name"] = self.hotkey_name
+            save_config(self.config)
+            self._set_hotkey_label(f"Capture Shortcut:  {pretty_hotkey(self.hotkey_name)}")
+            self.tray.setToolTip(f"{APP_NAME} - press {pretty_hotkey(self.hotkey_name)} to capture")
+            self._notify(f"Shortcut changed to {pretty_hotkey(self.hotkey_name)}", ms=2000)
+
+    # --------------------------------------------------------------- camera
+
     def _populate_camera_menu(self):
         """Populate the camera submenu with available cameras."""
         self._camera_menu.clear()
@@ -519,57 +695,50 @@ class ScreenCaptureApp:
             no_cam = QAction("No cameras detected", self._camera_menu)
             no_cam.setEnabled(False)
             self._camera_menu.addAction(no_cam)
-            return
-
         for idx, name in self._available_cameras:
             action = QAction(name, self._camera_menu)
             action.setCheckable(True)
             action.setChecked(idx == self._camera_index)
             action.triggered.connect(lambda checked, i=idx, n=name: self._select_camera(i, n))
             self._camera_menu.addAction(action)
+        self._camera_menu.addSeparator()
+        refresh = QAction("Refresh list", self._camera_menu)
+        refresh.triggered.connect(lambda: list_cameras(refresh=True))
+        self._camera_menu.addAction(refresh)
 
     def _select_camera(self, index: int, name: str):
-        """Select a camera by index."""
         self._camera_index = index
         self.config["camera_index"] = index
         save_config(self.config)
-        self.tray.showMessage(
-            "ScreenCapture",
-            f"Camera set to: {name}",
-            QSystemTrayIcon.MessageIcon.Information,
-            2000
-        )
+        self._notify(f"Camera set to: {name}", ms=2000)
 
     def _on_tray_activated(self, reason):
-        """Handle tray icon activation"""
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.start_capture()
-    
+        elif reason == QSystemTrayIcon.ActivationReason.Trigger and IS_WINDOWS:
+            # Single left click on Windows: capture too (that's what people try first)
+            self.start_capture()
+
+    # -------------------------------------------------------------- capture
+
     def start_capture(self):
         """Start the screen capture process, or stop recording if active."""
         if self._is_recording:
             self._stop_recording()
             return
-
-        # Without Screen Recording permission macOS hands back only the
-        # desktop wallpaper. Detect that and guide the user instead of
-        # silently capturing a useless screenshot.
+        if self._setup_panel is not None or self._countdown is not None:
+            return  # a recording is being set up; ignore the hotkey
         if IS_MACOS and not self._ensure_screen_recording():
             return
-
         if self.overlay:
             self.overlay.close()
             self.overlay = None
-
-        # No 100ms delay: the gap was long enough for macOS to dismiss
-        # the menu and reveal the desktop wallpaper, which then got
-        # captured instead of the user's actual windows. Grab on the
-        # same runloop tick as the trigger.
+        # Grab on the same runloop tick as the trigger (a delay let the menu
+        # dismiss animation or the desktop show up in the screenshot).
         self._do_capture()
-    
+
     def _ensure_screen_recording(self) -> bool:
-        """Return True if we can capture real screen content. If permission
-        is missing, fire the system prompt + guide the user to Settings."""
+        """macOS: True if we can capture real screen content, else guide the user."""
         try:
             from platform_utils import (
                 has_screen_recording_permission,
@@ -580,14 +749,14 @@ class ScreenCaptureApp:
             return True
         if has_screen_recording_permission():
             return True
-        request_screen_recording_permission()  # one-shot system prompt
+        request_screen_recording_permission()
         msg = QMessageBox()
         msg.setWindowTitle("Screen Recording permission needed")
         msg.setIcon(QMessageBox.Icon.Information)
         msg.setText(
             "ScreenCapture needs Screen Recording permission to capture your "
             "windows. Without it, screenshots show only the desktop wallpaper.\n\n"
-            "Enable ScreenCapture under System Settings → Privacy & Security → "
+            "Enable ScreenCapture under System Settings > Privacy & Security > "
             "Screen Recording, then quit and reopen the app."
         )
         msg.setWindowFlags(msg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
@@ -596,25 +765,13 @@ class ScreenCaptureApp:
         return False
 
     def _do_capture(self):
-        """Perform capture on the screen under the mouse"""
+        """Freeze the screen under the mouse and open the selection overlay."""
         try:
-            # 1. Find the screen where the mouse is located
             cursor_pos = QCursor.pos()
-            screen = QGuiApplication.screenAt(cursor_pos)
-            
-            if not screen:
-                screen = QGuiApplication.primaryScreen()
-            
-            # 2. Get Geometry (logical points)
-            geo = screen.geometry()
+            screen = QGuiApplication.screenAt(cursor_pos) or QGuiApplication.primaryScreen()
+            geo = screen.geometry()  # logical
+            px, py, pw, ph = physical_screen_rect(screen)
 
-            # 3. Capture the screen region.
-            #    Default = mss, which produces screenshots at the familiar
-            #    on-screen size. Retina displays have 2x the physical pixels;
-            #    capturing all of them (via CGWindowListCreateImage) makes the
-            #    image sharper BUT also 2x the pixel dimensions, so it opens
-            #    larger. Some users find that "zoomed". It's therefore opt-in
-            #    via config "high_res_screenshots": true.
             screenshot = None
             if IS_MACOS and self.config.get("high_res_screenshots"):
                 try:
@@ -627,28 +784,20 @@ class ScreenCaptureApp:
                     print(f"[capture] CG grab failed ({e}); using mss")
                     screenshot = None
             if screenshot is None:
-                screenshot = capture_region(geo.x(), geo.y(), geo.width(), geo.height())
+                screenshot = capture_region(px, py, pw, ph)
 
-            # 4. Compute capture DPR (physical pixels / logical pixels)
             capture_dpr = screenshot.width / geo.width() if geo.width() > 0 else 1.0
-
-            # 5. Store for recording use
             self._last_screen_geo = geo
             self._last_capture_dpr = capture_dpr
+            self._last_phys_origin = (px, py)
 
-            # 6. Create overlay
             self.overlay = OverlayWindow(screenshot, geo.x(), geo.y(), capture_dpr)
             self.overlay.selection_cancelled.connect(self._on_overlay_closed)
             self.overlay.image_copied.connect(self._on_overlay_closed)
-            self.overlay.image_saved.connect(self._on_overlay_closed)
+            self.overlay.image_saved.connect(self._on_image_saved)
             self.overlay.recording_requested.connect(self._on_recording_requested)
-            
             self.overlay.setGeometry(geo)
-            # Realize the underlying NSWindow BEFORE showing so we can
-            # mark it CanJoinAllSpaces + non-activating. If the window
-            # is shown first with the default collection behavior,
-            # macOS switches to the app's "home" Space and shows the
-            # desktop there — the bug that plagued the previous build.
+
             if IS_MACOS:
                 _prepare_overlay_window(self.overlay)
             self.overlay.show()
@@ -656,42 +805,49 @@ class ScreenCaptureApp:
                 _make_key_without_activating(self.overlay)
             else:
                 self.overlay.activateWindow()
+                force_foreground(self.overlay)  # keyboard focus even without the foreground lock
+                self.overlay.setFocus()
             self.overlay.raise_()
-            
         except Exception as e:
             QMessageBox.critical(None, "Capture Error", f"Failed to capture screen: {e}")
-    
+
     def _on_overlay_closed(self):
-        """Handle overlay close"""
         self.overlay = None
 
-    # --- Recording lifecycle ---
+    def _on_image_saved(self, path: str):
+        self.overlay = None
+        # Windows: a click-to-open toast is the natural feedback. macOS: none
+        # (menu-bar apps there stay quiet; the Save dialog already showed where).
+        if IS_WINDOWS:
+            self._notify(f"Saved {os.path.basename(path)}  (click to show in folder)",
+                         title="Screenshot saved", ms=4000, path=path)
+
+    # --------------------------------------------------- recording lifecycle
+
+    def _to_physical(self, logical_rect: QRect) -> dict:
+        """Logical screen rect -> physical mss region (uses the captured screen's origin)."""
+        geo = self._last_screen_geo
+        dpr = self._last_capture_dpr
+        px, py = self._last_phys_origin
+        return {
+            "left": px + int(round((logical_rect.x() - geo.x()) * dpr)),
+            "top": py + int(round((logical_rect.y() - geo.y()) * dpr)),
+            "width": int(round(logical_rect.width() * dpr)),
+            "height": int(round(logical_rect.height() * dpr)),
+        }
 
     def _on_recording_requested(self, selection_rect: QRect):
         """Called when user clicks the record button in the overlay."""
         self.overlay = None  # overlay already closed itself
-
         geo = self._last_screen_geo
-        dpr = self._last_capture_dpr
 
-        # Convert logical selection rect to physical mss region
-        phys_region = {
-            "left": int((geo.x() + selection_rect.x()) * dpr),
-            "top": int((geo.y() + selection_rect.y()) * dpr),
-            "width": int(selection_rect.width() * dpr),
-            "height": int(selection_rect.height() * dpr),
-        }
-        self._pending_record_region = phys_region
         self._pending_logical_rect = QRect(
-            geo.x() + selection_rect.x(),
-            geo.y() + selection_rect.y(),
-            selection_rect.width(),
-            selection_rect.height(),
+            geo.x() + selection_rect.x(), geo.y() + selection_rect.y(),
+            selection_rect.width(), selection_rect.height(),
         )
+        self._pending_record_region = self._to_physical(self._pending_logical_rect)
 
         # --- Loom-style setup phase ---
-        # Show the recording-area border + a setup card so the user can place
-        # their webcam and toggle camera/mic, then press Start when ready.
         self._recording_frame = RecordingFrame(self._pending_logical_rect)
         self._recording_frame.region_moved.connect(self._on_region_moved)
         self._recording_frame.show()
@@ -701,6 +857,14 @@ class ScreenCaptureApp:
         if cam_default and self._camera_authorized():
             self._show_webcam_preview()
 
+        sys_audio_on = None
+        try:
+            from audio_helper import system_audio_available
+            if system_audio_available():
+                sys_audio_on = bool(self.config.get("system_audio", True))
+        except Exception:
+            pass
+
         from setup_panel import SetupPanel
         self._setup_panel = SetupPanel(
             geo,
@@ -708,14 +872,14 @@ class ScreenCaptureApp:
             mic_name="Microphone",
             webcam_on=cam_default,
             mic_on=mic_default,
+            system_audio_on=sys_audio_on,
         )
         self._setup_panel.webcam_toggled.connect(self._on_webcam_toggled)
         self._setup_panel.mic_toggled.connect(self._on_setup_mic)
+        self._setup_panel.system_audio_toggled.connect(self._on_setup_sys_audio)
         self._setup_panel.start_clicked.connect(self._begin_countdown)
         self._setup_panel.cancel_clicked.connect(self._cancel_setup)
         self._setup_panel.show()
-
-    # -- setup-phase helpers ----------------------------------------------
 
     def _camera_authorized(self) -> bool:
         if not IS_MACOS:
@@ -739,11 +903,16 @@ class ScreenCaptureApp:
         return "Webcam"
 
     def _on_setup_mic(self, on: bool):
-        self.config["mic_default"] = bool(on)
-        save_config(self.config)
+        self._set_bool("mic_default", on)
+
+    def _on_setup_sys_audio(self, on: bool):
+        self._set_bool("system_audio", on)
+        if getattr(self, "_sys_audio_action", None) is not None:
+            self._sys_audio_action.blockSignals(True)
+            self._sys_audio_action.setChecked(bool(on))
+            self._sys_audio_action.blockSignals(False)
 
     def _begin_countdown(self):
-        """Start clicked in the setup panel → countdown → recording."""
         if self._setup_panel:
             self._setup_panel.close()
             self._setup_panel = None
@@ -753,7 +922,6 @@ class ScreenCaptureApp:
         self._countdown.show()
 
     def _cancel_setup(self):
-        """X in the setup panel → tear everything down, no recording."""
         if self._setup_panel:
             self._setup_panel.close()
             self._setup_panel = None
@@ -783,36 +951,28 @@ class ScreenCaptureApp:
             logical_origin=logical_origin,
             target_height=target_height,
             mic_muted=not bool(self.config.get("mic_default", True)),
-            # Webcam circle lags the voice through the camera→preview→capture
-            # pipeline; delay audio to match it. ~160 ms is a typical webcam
-            # pipeline latency. Only applied when the webcam is on.
             webcam_latency_ms=(160 if self._webcam_preview is not None else 0),
+            system_audio=bool(self.config.get("system_audio", True)),
+            show_cursor=bool(self.config.get("show_cursor", True)),
         )
         self._recorder.recording_stopped.connect(self._on_recording_stopped)
         self._recorder.recording_error.connect(self._on_recording_error)
 
-        # The recording-area border is already on screen from the setup phase.
         if self._recording_frame is None:
             self._recording_frame = RecordingFrame(self._pending_logical_rect)
             self._recording_frame.region_moved.connect(self._on_region_moved)
             self._recording_frame.show()
 
-        # Create annotation overlay (starts click-through / inactive)
         try:
             self._annotation_overlay = RecordingAnnotationOverlay(self._pending_logical_rect)
             self._annotation_overlay.show()
             self._recorder.set_annotation_overlay(self._annotation_overlay)
-            print("[DEBUG] Annotation overlay created OK")
         except Exception as e:
-            print(f"[DEBUG] Annotation overlay FAILED: {e}")
-            import traceback; traceback.print_exc()
+            print(f"[recording] annotation overlay failed: {e}")
 
-        # Show ScreenPal-style recording toolbar
         try:
-            self._toolbar = RecordingToolbar(
-                self._last_screen_geo,
-                recording_rect=self._pending_logical_rect
-            )
+            self._toolbar = RecordingToolbar(self._last_screen_geo,
+                                             recording_rect=self._pending_logical_rect)
             self._toolbar.stop_clicked.connect(self._stop_recording)
             self._toolbar.pause_clicked.connect(self._on_pause_recording)
             self._toolbar.resume_clicked.connect(self._on_resume_recording)
@@ -820,12 +980,9 @@ class ScreenCaptureApp:
             self._toolbar.webcam_toggled.connect(self._on_webcam_toggled)
             self._toolbar.draw_toggled.connect(self._on_draw_toggled)
             self._toolbar.show()
-            print(f"[DEBUG] RecordingToolbar created at {self._toolbar.pos()}, size={self._toolbar.size()}, visible={self._toolbar.isVisible()}")
         except Exception as e:
-            print(f"[DEBUG] RecordingToolbar FAILED: {e}")
-            import traceback; traceback.print_exc()
+            print(f"[recording] toolbar failed: {e}")
 
-        # Reflect the webcam/mic choices made in the setup panel on the toolbar.
         if self._toolbar:
             if self._webcam_preview is not None:
                 self._toolbar.set_webcam_on()
@@ -838,9 +995,7 @@ class ScreenCaptureApp:
         self._is_recording = True
         self._set_stop_visible(True)
         self._recorder.start()
-        print("[DEBUG] Recording started")
-
-    # --- Recording control handlers ---
+        print("[recording] started")
 
     def _on_pause_recording(self):
         if self._recorder:
@@ -855,15 +1010,8 @@ class ScreenCaptureApp:
             self._recorder.set_mic_muted(muted)
 
     def _on_webcam_toggled(self, on: bool):
-        # Remember the choice so the next recording starts with the webcam
-        # already showing (no clicking + waiting mid-recording).
-        self.config["webcam_default"] = bool(on)
-        save_config(self.config)
+        self._set_bool("webcam_default", on)
         if on:
-            # Camera needs explicit TCC permission. OpenCV is told to skip its
-            # own auth request, so request via AVFoundation and only open the
-            # camera once granted. Works in BOTH the setup phase and during
-            # recording (no recorder dependency — the preview is captured).
             if IS_MACOS:
                 from platform_utils import camera_permission_status, request_camera_permission
                 status = camera_permission_status()
@@ -873,7 +1021,7 @@ class ScreenCaptureApp:
                     request_camera_permission(
                         lambda g: self.signal_emitter.camera_result.emit(bool(g))
                     )
-                else:  # denied / restricted
+                else:
                     self._show_camera_denied()
             else:
                 self._show_webcam_preview()
@@ -881,11 +1029,7 @@ class ScreenCaptureApp:
             self._hide_webcam_preview()
 
     def _show_webcam_preview(self):
-        """Open the camera (if needed) and show the draggable circular PiP.
-
-        Used both in the setup phase and during recording; the preview is
-        captured by the screen recorder, so no compositing is needed.
-        """
+        """Open the camera (if needed) and show the draggable circular PiP."""
         if self._webcam_preview is not None:
             return
         if self._pending_logical_rect is None:
@@ -894,9 +1038,7 @@ class ScreenCaptureApp:
             self._webcam = WebcamCapture(device_index=self._camera_index)
             self._webcam.start()
         self._webcam_preview = WebcamPreviewWidget(
-            self._webcam,
-            self._pending_logical_rect,
-            dpr=self._last_capture_dpr,
+            self._webcam, self._pending_logical_rect, dpr=self._last_capture_dpr,
         )
         self._webcam_preview.position_changed.connect(self._on_webcam_position)
         self._webcam_preview.show()
@@ -916,14 +1058,12 @@ class ScreenCaptureApp:
             self._webcam = None
 
     def _on_camera_result(self, granted: bool):
-        """Main-thread handler for the async camera permission result."""
         if granted:
             self._show_webcam_preview()
         else:
             self._show_camera_denied()
 
     def _show_camera_denied(self):
-        """Tell the user how to enable the camera and open Settings."""
         from platform_utils import open_settings_pane
         if self._toolbar:
             try:
@@ -935,7 +1075,7 @@ class ScreenCaptureApp:
         msg.setIcon(QMessageBox.Icon.Information)
         msg.setText(
             "ScreenCapture needs Camera permission for the webcam overlay.\n\n"
-            "Enable it under System Settings → Privacy & Security → Camera, "
+            "Enable it under System Settings > Privacy & Security > Camera, "
             "then toggle the webcam again."
         )
         msg.setWindowFlags(msg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
@@ -949,32 +1089,27 @@ class ScreenCaptureApp:
 
     def _on_region_moved(self, new_rect: QRect):
         """Called when the user drags the red recording border (setup or live)."""
-        dpr = self._last_capture_dpr
         self._pending_logical_rect = QRect(new_rect)
-
+        phys = self._to_physical(new_rect)
         if self._recorder is not None:
             self._recorder.region = {
-                "left": int(new_rect.x() * dpr),
-                "top": int(new_rect.y() * dpr),
-                "width": self._recorder.region["width"],   # keep same size
+                "left": phys["left"], "top": phys["top"],
+                "width": self._recorder.region["width"],   # keep the encoder size
                 "height": self._recorder.region["height"],
             }
             self._recorder.logical_origin = (new_rect.x(), new_rect.y())
         elif self._pending_record_region:
-            # Setup phase (no recorder yet): move the pending capture region.
-            self._pending_record_region["left"] = int(new_rect.x() * dpr)
-            self._pending_record_region["top"] = int(new_rect.y() * dpr)
+            self._pending_record_region["left"] = phys["left"]
+            self._pending_record_region["top"] = phys["top"]
 
         if self._annotation_overlay:
             self._annotation_overlay.setGeometry(new_rect)
-        # Keep the webcam circle clamped to the moved region.
         if self._webcam_preview is not None:
             self._webcam_preview._recording_rect = QRect(new_rect)
 
     def _on_draw_toggled(self, active: bool):
         if self._annotation_overlay:
             self._annotation_overlay.set_drawing_active(active)
-
         if active:
             if not self._draw_panel:
                 self._draw_panel = DrawingSubPanel(self._toolbar)
@@ -983,9 +1118,8 @@ class ScreenCaptureApp:
                 self._draw_panel.clear_clicked.connect(self._on_draw_clear)
             self._draw_panel.position_near_toolbar()
             self._draw_panel.show()
-        else:
-            if self._draw_panel:
-                self._draw_panel.hide()
+        elif self._draw_panel:
+            self._draw_panel.hide()
 
     def _on_draw_tool_selected(self, tool_name: str):
         if self._annotation_overlay:
@@ -1000,19 +1134,15 @@ class ScreenCaptureApp:
             self._annotation_overlay.clear_annotations()
 
     def _stop_recording(self):
-        """Stop recording — and clear the UI INSTANTLY so it feels reactive.
+        """Stop recording - and clear the UI INSTANTLY so it feels reactive.
 
         Finalizing the file (flush encoder + mix audio + ffmpeg remux) takes a
-        beat. We don't make the user stare at the controls while it happens:
-        the overlays vanish the moment Stop is pressed, and the recorder keeps
-        finalizing on its own thread. _on_recording_stopped then does the real
-        teardown and reveals the saved file in Finder.
+        beat. The overlays vanish the moment Stop is pressed and the recorder
+        finalizes on its own thread; _on_recording_stopped does the teardown
+        and reveals the saved file.
         """
         if not self._recorder:
             return
-        # Hide (don't destroy) every on-screen recording widget right now.
-        # Destroying happens later in _cleanup_recording, once the recorder
-        # thread has finished and emitted recording_stopped.
         for w in (self._toolbar, self._stop_btn, self._draw_panel,
                   self._recording_frame, self._annotation_overlay,
                   self._webcam_preview, self._setup_panel):
@@ -1025,60 +1155,27 @@ class ScreenCaptureApp:
         self._recorder.stop()
 
     def _on_recording_stopped(self, file_path: str):
-        """Called when the recorder finishes saving."""
         self._cleanup_recording()
-        # Reveal the new recording in Finder — quiet, professional feedback
-        # instead of a notification banner.
-        try:
-            import subprocess
-            if os.path.exists(file_path):
-                subprocess.Popen(["open", "-R", file_path])
-            else:
-                subprocess.Popen(["open", get_recordings_dir()])
-        except Exception:
-            pass
-
-    def _open_recordings_folder(self):
-        """Open the recordings folder in Finder."""
-        try:
-            import subprocess
-            subprocess.Popen(["open", get_recordings_dir()])
-        except Exception:
-            pass
+        # Reveal the new file in Finder / Explorer: quiet, professional feedback.
+        if os.path.exists(file_path):
+            reveal_in_file_manager(file_path)
+        else:
+            open_folder(get_recordings_dir())
 
     def _on_recording_error(self, error_msg: str):
-        """Called on recording error."""
         self._cleanup_recording()
-        self.tray.showMessage(
-            "Recording Error",
-            error_msg,
-            QSystemTrayIcon.MessageIcon.Critical,
-            4000
-        )
+        self._notify(error_msg, title="Recording error", ms=5000, critical=True)
 
     def _cleanup_recording(self):
-        """Clean up recording state."""
-        if self._setup_panel:
-            self._setup_panel.close()
-            self._setup_panel = None
-        if self._stop_btn:
-            self._stop_btn.close()
-            self._stop_btn = None
-        if self._toolbar:
-            self._toolbar.close()
-            self._toolbar = None
-        if self._draw_panel:
-            self._draw_panel.close()
-            self._draw_panel = None
-        if self._recording_frame:
-            self._recording_frame.close()
-            self._recording_frame = None
-        if self._annotation_overlay:
-            self._annotation_overlay.close()
-            self._annotation_overlay = None
-        if self._webcam_preview:
-            self._webcam_preview.close()
-            self._webcam_preview = None
+        for attr in ("_setup_panel", "_stop_btn", "_toolbar", "_draw_panel",
+                     "_recording_frame", "_annotation_overlay", "_webcam_preview"):
+            w = getattr(self, attr)
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         if self._webcam:
             self._webcam.stop()
             self._webcam.wait(2000)
@@ -1089,86 +1186,160 @@ class ScreenCaptureApp:
         self._pending_logical_rect = None
         self._set_stop_visible(False)
 
+    # ---------------------------------------------------------------- misc
+
     def _show_about(self):
-        """Show a clean About dialog with the feather icon."""
         msg = QMessageBox()
-        msg.setWindowTitle("ScreenCapture")
-        msg.setText("ScreenCapture")
+        msg.setWindowTitle(APP_NAME)
+        msg.setText(f"<b style='font-size:15px'>{APP_NAME}</b>")
         msg.setInformativeText(
-            "A fast, clean screenshot & screen recorder.\n\n"
-            f"Press {self.hotkey_name} anywhere to capture — drag to select, "
-            "then copy, save, annotate, or record with webcam + audio."
+            "Screenshots and screen recordings, LightShot / Loom style.\n\n"
+            f"Press {pretty_hotkey(self.hotkey_name)} anywhere: drag to select, then copy, "
+            "save, annotate (arrow, box, blur, text...) or record with webcam and audio.\n\n"
+            "Shortcuts inside the overlay: Enter = copy, Ctrl+S = save, "
+            "Ctrl+Z / Ctrl+Y = undo / redo, Ctrl+A = whole screen, Esc = close."
         )
-        icon_path = os.path.join(os.path.dirname(__file__), "assets", "icon.png")
+        icon_path = os.path.join(ASSETS_DIR, "icon.png")
         if os.path.exists(icon_path):
-            from PyQt6.QtGui import QPixmap
             pix = QPixmap(icon_path).scaled(
                 72, 72, Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation)
             msg.setIconPixmap(pix)
         msg.setWindowFlags(msg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         msg.exec()
-    
+
     def _quit(self):
-        """Quit the application"""
+        if self._recorder:
+            try:
+                self._recorder.stop()
+                self._recorder.wait(8000)
+            except Exception:
+                pass
+        if self._win_hotkey:
+            self._win_hotkey.unregister()
         self.tray.hide()
         self.app.quit()
-    
+
     def run(self):
-        """Run the application"""
         return self.app.exec()
 
 
+# ---------------------------------------------------------------------------
+# macOS overlay window helpers (no-ops elsewhere)
+# ---------------------------------------------------------------------------
+
+def _prepare_overlay_window(widget):
+    """Realize a Qt widget's underlying NSWindow and configure it for
+    macOS before the first show(): CanJoinAllSpaces (no Space switch) plus
+    the non-activating panel mask (keyboard works without activating)."""
+    if not IS_MACOS:
+        return
+    try:
+        import ctypes as _ct
+        import objc
+        from AppKit import (
+            NSWindowCollectionBehaviorCanJoinAllSpaces,
+            NSWindowCollectionBehaviorStationary,
+            NSWindowCollectionBehaviorIgnoresCycle,
+            NSWindowCollectionBehaviorFullScreenAuxiliary,
+            NSWindowCollectionBehaviorTransient,
+            NSWindowStyleMaskNonactivatingPanel,
+        )
+        widget.create()
+        ptr = int(widget.winId())
+        if ptr == 0:
+            return
+        nsview = objc.objc_object(c_void_p=_ct.c_void_p(ptr))
+        nswindow = nsview.window()
+        if nswindow is None:
+            return
+        nswindow.setLevel_(25)
+        nswindow.setHidesOnDeactivate_(False)
+        nswindow.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorIgnoresCycle
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorTransient
+        )
+        try:
+            current_mask = int(nswindow.styleMask())
+            nswindow.setStyleMask_(current_mask | NSWindowStyleMaskNonactivatingPanel)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"_prepare_overlay_window: {e}")
+
+
+def _make_key_without_activating(widget):
+    """Give the overlay keyboard focus on macOS (activates the app; safe
+    because the window already joins all Spaces)."""
+    if not IS_MACOS:
+        return
+    try:
+        import ctypes as _ct
+        import objc
+        from AppKit import NSApp
+        ptr = int(widget.winId())
+        if ptr == 0:
+            widget.activateWindow()
+            widget.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+            return
+        nsview = objc.objc_object(c_void_p=_ct.c_void_p(ptr))
+        nswindow = nsview.window()
+        if nswindow is not None:
+            nswindow.makeKeyAndOrderFront_(None)
+        try:
+            NSApp.activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
+        widget.activateWindow()
+        widget.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+    except Exception as e:
+        print(f"_make_key_without_activating: {e}")
+        widget.activateWindow()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def show_already_running_notification():
-    """Show a notification that the app is already running"""
-    # Quick QApplication just to show the notification
+    """Tell the user the app is already in the tray, then exit."""
     temp_app = QApplication(sys.argv)
     temp_app.setQuitOnLastWindowClosed(False)
-    
-    icon_path = os.path.join(os.path.dirname(__file__), "assets", "icon.png")
+    icon_path = os.path.join(ASSETS_DIR, "icon.ico" if IS_WINDOWS else "icon.png")
     tray = QSystemTrayIcon()
     if os.path.exists(icon_path):
         tray.setIcon(QIcon(icon_path))
     tray.show()
     tray.showMessage(
-        "ScreenCapture",
-        "ScreenCapture is already running! Look for the icon in the system tray.",
+        APP_NAME,
+        "ScreenCapture is already running - look for its icon in the system tray.",
         QSystemTrayIcon.MessageIcon.Information,
         3000
     )
-    # Give time for notification to show
     QTimer.singleShot(3500, temp_app.quit)
     temp_app.exec()
 
 
-# Global lock socket to prevent garbage collection
-_lock_socket = None
+_lock_socket = None  # kept alive for the process lifetime
+
 
 def main():
-    """Entry point"""
     global _lock_socket
     import socket
-    
-    # Use socket binding as single-instance lock (very reliable on Windows)
+
+    # Single-instance lock: binding a localhost port is reliable on every OS.
     try:
         _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        _lock_socket.bind(('127.0.0.1', 47392))  # Arbitrary high port
+        _lock_socket.bind(('127.0.0.1', LOCK_PORT))
     except socket.error:
-        # Port already in use = another instance is running
         show_already_running_notification()
         sys.exit(0)
 
-    # Ensure Windows recognizes us as DPI Aware (Backup to os.environ)
-    if IS_WINDOWS:
-        try:
-            ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
-        except:
-            pass
-    
     app = ScreenCaptureApp()
-
-    # No startup notification — the menu-bar icon is enough. Professional
-    # menu-bar apps don't toast on launch.
+    # No startup toast - the tray icon is enough.
     sys.exit(app.run())
 
 

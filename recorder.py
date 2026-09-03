@@ -21,12 +21,15 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QWidget, QApplication
 
-IS_MACOS = sys.platform == "darwin"
-IS_WINDOWS = sys.platform == "win32"
-SYSTEM_FONT = ".AppleSystemUIFont" if IS_MACOS else "Segoe UI"
+from platform_utils import (
+    IS_MACOS, IS_WINDOWS, SYSTEM_FONT, recordings_dir,
+    set_click_through, make_non_activating, cursor_pos_physical,
+)
 
-# --- Mouse cursor overlay (macOS) ---
-_HAS_CURSOR = False
+# --- Mouse cursor overlay ---
+# macOS: NSEvent.mouseLocation (logical points, bottom-left origin).
+# Windows: GetCursorPos (physical pixels) via platform_utils.cursor_pos_physical.
+_HAS_CURSOR = IS_WINDOWS
 if IS_MACOS:
     try:
         from AppKit import NSEvent, NSScreen
@@ -98,7 +101,7 @@ def _configure_clickable_panel(widget, level=25):
         win = objc.objc_object(c_void_p=_ct.c_void_p(ptr)).window()
         if win is None:
             return
-        # NSPanel-only knobs (Qt.Tool windows are NSPanels) — guarded.
+        # NSPanel-only knobs (Qt.Tool windows are NSPanels) - guarded.
         try:
             win.setStyleMask_(int(win.styleMask()) | NSWindowStyleMaskNonactivatingPanel)
         except Exception:
@@ -120,6 +123,19 @@ def _configure_clickable_panel(widget, level=25):
         )
     except Exception as e:
         print(f"_configure_clickable_panel: {e}")
+
+def _set_click_through(widget, enabled: bool):
+    """Click-through on/off for an overlay window.
+
+    macOS keeps the exact NSWindow recipe that was debugged on the Mac
+    (_configure_nswindow: ignoresMouseEvents + level 25 + the three
+    collection-behaviour flags). Windows toggles WS_EX_TRANSPARENT.
+    """
+    if IS_MACOS:
+        _configure_nswindow(widget, click_through=enabled, level=25)
+    else:
+        set_click_through(widget, enabled)
+
 
 # Arrow cursor bitmap: 0=transparent, 1=black outline, 2=white fill
 _CURSOR_BITMAP = np.array([
@@ -248,12 +264,7 @@ def _composite_annotation(frame, ann, dpr):
 
 def get_recordings_dir() -> str:
     """Get the recordings output directory, creating it if needed."""
-    if IS_MACOS:
-        base = os.path.expanduser("~/Movies/ScreenCapture")
-    else:
-        base = os.path.expanduser("~/Videos/ScreenCapture")
-    os.makedirs(base, exist_ok=True)
-    return base
+    return recordings_dir()
 
 
 def generate_filename() -> str:
@@ -280,9 +291,13 @@ class ScreenRecorder(QThread):
     def __init__(self, region: dict, output_path: str, fps: int = 30,
                  dpr: float = 1.0, logical_origin: tuple = (0, 0),
                  target_height: int = None, mic_muted: bool = False,
-                 webcam_latency_ms: int = 0):
+                 webcam_latency_ms: int = 0, system_audio: bool = True,
+                 show_cursor: bool = True):
         super().__init__()
         self._initial_mic_muted = bool(mic_muted)
+        # Record what the computer plays (WASAPI loopback / ScreenCaptureKit).
+        self.system_audio = bool(system_audio)
+        self.show_cursor = bool(show_cursor)
         self.region = dict(region)
         self.output_path = output_path
         self.fps = fps
@@ -388,12 +403,12 @@ class ScreenRecorder(QThread):
             # Each source begins capturing at a DIFFERENT moment (the system
             # helper blocks until ready; the mic starts after). We record each
             # one's real start time and later align each to the video start, so
-            # voice and system audio both line up with the picture — no manual
+            # voice and system audio both line up with the picture - no manual
             # offset needed.
             sys_start = mic_start = None
 
-            # System audio via ScreenCaptureKit (macOS 13+)
-            if IS_MACOS:
+            # System audio: ScreenCaptureKit (macOS 13+) or WASAPI loopback (Windows)
+            if self.system_audio:
                 try:
                     from audio_helper import SystemAudioCapture
                     sys_capture = SystemAudioCapture(sample_rate=audio_sample_rate)
@@ -403,7 +418,7 @@ class ScreenRecorder(QThread):
                     print(f"System audio unavailable: {e}")
                     sys_capture = None
 
-            # Microphone via sounddevice (blocking reads — no cffi callback)
+            # Microphone via sounddevice (blocking reads - no cffi callback)
             try:
                 from audio_helper import MicCapture
                 mic_capture = MicCapture(sample_rate=audio_sample_rate)
@@ -422,12 +437,13 @@ class ScreenRecorder(QThread):
             # --- Cursor setup ---
             cursor_black = cursor_white = None
             main_screen_h = 0
-            if _HAS_CURSOR:
+            if _HAS_CURSOR and self.show_cursor:
                 cursor_black, cursor_white = _build_cursor_masks(self.dpr)
-                main_screen_h = NSScreen.mainScreen().frame().size.height
+                if IS_MACOS:
+                    main_screen_h = NSScreen.mainScreen().frame().size.height
 
             # --- Video recording with PyAV (ultrafast preset) ---
-            # Use MKV container — MP4 muxer triggers errno 22 on macOS with PyAV
+            # Use MKV container - MP4 muxer triggers errno 22 on macOS with PyAV
             frame_interval = 1.0 / self.fps
             temp_container = temp_video.replace('.mp4', '.mkv')  # Write to MKV, remux to MP4 later
             # Output resolution: optionally scale to a target height (e.g. 1080p),
@@ -473,7 +489,7 @@ class ScreenRecorder(QThread):
                                           name="sc-encoder")
             enc_thread.start()
 
-            # Clock starts when we begin capturing frames — trim audio lead to match
+            # Clock starts when we begin capturing frames - trim audio lead to match
             self._recording_start = time.perf_counter()
             last_pts = -1  # Ensure strictly increasing PTS (duplicates cause mux errno 22)
 
@@ -492,9 +508,16 @@ class ScreenRecorder(QThread):
                     # Overlay mouse cursor
                     if cursor_black is not None:
                         try:
-                            pos = NSEvent.mouseLocation()
-                            cx = int((pos.x - self.logical_origin[0]) * self.dpr)
-                            cy = int(((main_screen_h - pos.y) - self.logical_origin[1]) * self.dpr)
+                            if IS_MACOS:
+                                pos = NSEvent.mouseLocation()
+                                cx = int((pos.x - self.logical_origin[0]) * self.dpr)
+                                cy = int(((main_screen_h - pos.y) - self.logical_origin[1]) * self.dpr)
+                            else:
+                                # Windows: GetCursorPos is already physical pixels,
+                                # same space as the mss region.
+                                ppos = cursor_pos_physical()
+                                cx = ppos[0] - self.region["left"] if ppos else -1000
+                                cy = ppos[1] - self.region["top"] if ppos else -1000
                             _overlay_cursor(frame, cx, cy, cursor_black, cursor_white)
                         except Exception:
                             pass
@@ -534,7 +557,7 @@ class ScreenRecorder(QThread):
                     # Hand off to the encoder thread. The queue absorbs short
                     # encode bursts; if it's momentarily full, drop this frame
                     # (playback just holds the previous one) rather than stall
-                    # capture — which keeps motion smooth.
+                    # capture - which keeps motion smooth.
                     try:
                         frame_q.put_nowait(video_frame)
                         last_pts = pts
@@ -576,7 +599,7 @@ class ScreenRecorder(QThread):
                 # picture (they begin capturing at different moments). A source
                 # that started BEFORE the first frame has its lead-in trimmed;
                 # one that started AFTER is padded with silence. This is what
-                # keeps voice on the lips automatically — no manual offset.
+                # keeps voice on the lips automatically - no manual offset.
                 def _align(arr, src_start, channels):
                     if src_start is None or len(arr) == 0:
                         return arr
@@ -679,7 +702,7 @@ class _DragHandle(QWidget):
 
     Separate top-level widget that sits above the recording border.
     Uses a window mask so only the visible pill area receives mouse
-    events — avoids the macOS NSView crash that occurs when transparent
+    events - avoids the macOS NSView crash that occurs when transparent
     pixels receive events on frameless WA_TranslucentBackground windows.
     """
 
@@ -699,10 +722,11 @@ class _DragHandle(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        make_non_activating(self)  # Windows: dragging must not steal focus
         self.setFixedSize(self.HANDLE_W, self.HANDLE_H)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
-        # Mask to pill shape — only the visible area receives events
+        # Mask to pill shape - only the visible area receives events
         path = QPainterPath()
         path.addRoundedRect(
             0.0, 0.0, float(self.HANDLE_W), float(self.HANDLE_H), 6.0, 6.0
@@ -773,6 +797,7 @@ class RecordingFrame(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        make_non_activating(self)
 
         self.setGeometry(
             region_rect.x() - pad,
@@ -795,14 +820,15 @@ class RecordingFrame(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        # Click-through: events pass to content beneath (no NSView crash)
-        _configure_nswindow(self, click_through=True, level=25)
+        # Click-through: events pass to content beneath (no NSView crash on
+        # macOS; WS_EX_TRANSPARENT on Windows so clicks reach the app below).
+        _set_click_through(self, True)
         self._handle.show()
 
     def hideEvent(self, event):
         super().hideEvent(event)
         # The drag handle is a SEPARATE top-level window, so hiding the frame
-        # doesn't hide it. Keep them in lockstep — otherwise the three red dots
+        # doesn't hide it. Keep them in lockstep - otherwise the three red dots
         # linger on screen after Stop until full teardown.
         if getattr(self, "_handle", None):
             self._handle.hide()
@@ -948,32 +974,19 @@ class RecordingAnnotationOverlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        make_non_activating(self)
         self.setGeometry(region_rect)
         self.setMouseTracking(True)
 
     def showEvent(self, event):
         super().showEvent(event)
-        _configure_nswindow(self, click_through=True, level=25)
-
-    def _set_macos_properties(self, click_through=True):
-        _configure_nswindow(self, click_through=click_through, level=25)
+        # Starts click-through (inactive); drawing mode flips it.
+        _set_click_through(self, not self._drawing_active)
 
     def set_drawing_active(self, active: bool):
         """Toggle drawing mode on/off."""
         self._drawing_active = active
-        if IS_MACOS:
-            self._set_macos_properties(click_through=not active)
-        elif IS_WINDOWS:
-            import ctypes
-            hwnd = int(self.winId())
-            GWL_EXSTYLE = -20
-            WS_EX_TRANSPARENT = 0x00000020
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            if active:
-                style &= ~WS_EX_TRANSPARENT
-            else:
-                style |= WS_EX_TRANSPARENT
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        _set_click_through(self, not active)
 
         if active:
             self.setCursor(Qt.CursorShape.CrossCursor)

@@ -19,7 +19,9 @@ _hidden = [
     'mac_tray', 'platform_utils',
     # heavy libs imported lazily inside functions (recorder/webcam)
     'cv2', 'av', 'mss', 'numpy', 'PIL',
-    'sounddevice', 'imageio_ffmpeg',
+    'sounddevice', 'imageio_ffmpeg', 'soundcard', 'pygrabber', 'pygrabber.dshow_graph',
+    'comtypes', 'app_config', 'audio_helper', 'setup_panel', 'countdown', 'webcam',
+    'recording_toolbar', 'recorder', 'overlay', 'tools', 'capture',
     # pyobjc frameworks used via lazy imports
     'AVFoundation', 'objc', 'Foundation', 'AppKit', 'Cocoa',
     'ApplicationServices', 'Quartz', 'CoreMedia', 'CoreAudio', 'CoreText',

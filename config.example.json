@@ -1,3 +1,13 @@
 {
-  "hotkey_name": "F13"
+  "hotkey_name": "Print",
+  "camera_index": 0,
+  "recording_size": "native",
+  "webcam_default": false,
+  "mic_default": true,
+  "system_audio": true,
+  "show_cursor": true,
+  "default_color": "#000000",
+  "last_save_dir": "",
+  "high_res_screenshots": false,
+  "windows_dpi_scaling": true
 }
