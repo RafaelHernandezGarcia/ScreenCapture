@@ -1,6 +1,9 @@
 @echo off
 setlocal enabledelayedexpansion
 title ScreenCapture - Windows installer
+:: "install.bat /quiet" = no pauses (for scripted installs)
+set "QUIET="
+if /i "%~1"=="/quiet" set "QUIET=1"
 echo ============================================================
 echo   ScreenCapture - Windows installation
 echo ============================================================
@@ -70,6 +73,11 @@ if not errorlevel 1 (
 :check_running
 "%PYTHON_EXE%" -c "import socket,sys;s=socket.socket();s.settimeout(0.3);sys.exit(0 if s.connect_ex(('127.0.0.1',47392)) else 1)" >nul 2>&1
 if not errorlevel 1 (
+    if defined QUIET (
+        echo Waiting for the running copy to exit...
+        timeout /t 2 /nobreak >nul
+        goto :check_running
+    )
     echo.
     echo A copy of ScreenCapture is still running. Right-click its tray icon,
     echo choose Exit / Quit ScreenCapture, then press any key to continue.
@@ -147,5 +155,5 @@ echo   - Press the Windows key and type "ScreenCapture" to open it.
 echo   - It starts automatically at login (tray menu can turn that off).
 echo   - Press PrintScreen to capture. Change the key from the tray menu.
 echo.
-start "" "%PYTHONW_EXE%" "%INSTALL_DIR%\main.py"
-pause
+start "" /D "%INSTALL_DIR%" "%PYTHONW_EXE%" "%INSTALL_DIR%\main.py"
+if not defined QUIET pause
