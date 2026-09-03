@@ -1,56 +1,52 @@
 """
-Overlay Window - LightShot clone with full resizing, moving, and exact styling
+Overlay Window - LightShot-style region selection + annotation, drawn over a
+frozen screenshot of the screen under the mouse.
+
+Coordinate spaces (this matters on high-DPI Windows and Retina macs):
+- The widget works in LOGICAL pixels (Qt geometry of the screen).
+- The screenshot pixmap holds PHYSICAL pixels and is tagged with
+  setDevicePixelRatio(capture_dpr), so Qt draws it crisp at logical size.
+- The result image is rendered at PHYSICAL resolution (see _get_result_image)
+  so what you copy/save has every real pixel.
 """
-import sys
 import os
-import json
 import re
+from datetime import datetime
 from enum import Enum
 
-IS_MACOS = sys.platform == "darwin"
-SYSTEM_FONT = ".AppleSystemUIFont" if IS_MACOS else "Segoe UI"
-
-from PyQt6.QtCore import Qt, QPoint, QRect, pyqtSignal, QSize, QEvent
+from PyQt6.QtCore import Qt, QPoint, QRect, pyqtSignal, QSize
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QPixmap, QFont, QImage, QIcon,
-    QPainterPath, QBrush, QAction, QCursor, QRegularExpressionValidator
+    QPainterPath, QFontMetrics,
 )
 from PyQt6.QtWidgets import (
     QWidget, QApplication, QToolButton, QHBoxLayout,
-    QVBoxLayout, QFrame, QColorDialog, QFileDialog, QInputDialog, QButtonGroup,
+    QVBoxLayout, QFrame, QColorDialog, QFileDialog, QButtonGroup,
     QLabel, QLineEdit, QCheckBox, QDialog, QPushButton, QGraphicsDropShadowEffect
 )
 from PIL import Image
 
-# Shared config path (same as main.py)
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-
-def _load_config():
-    try:
-        with open(_CONFIG_PATH, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def _save_config(cfg):
-    with open(_CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+from platform_utils import (
+    IS_MACOS, IS_WINDOWS, SYSTEM_FONT, BRAND_PURPLE, BRAND_PURPLE_SOFT,
+    INK_SOFT, CARD_BORDER, screenshots_dir, copy_image_to_clipboard,
+)
+import app_config
+from tools import (
+    ArrowTool, RectangleTool, CircleTool, LineTool, BlurTool,
+    PenTool, HighlighterTool, TextTool, DrawingAction, draw_action
+)
 
 # Qt maps the macOS Command key to Qt.ControlModifier by default (it swaps
 # Ctrl/Cmd on macOS, so physical Control arrives as MetaModifier). Accept
-# BOTH so ⌘C / ⌘S / ⌘Z work on macOS and Ctrl+… works on Windows —
+# BOTH so Cmd+C / Cmd+S / Cmd+Z work on macOS and Ctrl+... works on Windows -
 # regardless of the swap setting.
 MODIFIER_KEY = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
-
-# Import tools from your existing tools.py
-from tools import (
-    ArrowTool, RectangleTool, CircleTool, LineTool,
-    PenTool, HighlighterTool, TextTool, DrawingAction, draw_action
-)
 
 # --- Constants for Hit Testing ---
 HANDLE_SIZE = 10
 BORDER_WIDTH = 1
+MIN_SELECTION = 10
+
 
 class ResizeMode(Enum):
     NONE = 0
@@ -64,48 +60,49 @@ class ResizeMode(Enum):
     BOTTOM_RIGHT = 8
     MOVE = 9
 
+
 class IconFactory:
-    """Generates LightShot-style icons programmatically"""
-    
+    """Generates crisp line icons programmatically (no image assets needed)."""
+
     @staticmethod
     def create_icon(name: str, color: QColor) -> QIcon:
         size = 40
         pixmap = QPixmap(size, size)
         pixmap.fill(Qt.GlobalColor.transparent)
-        
+
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         pen = QPen(color)
         pen.setWidth(2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
-        
-        # Scale factor for 40px icons (was 32px)
+
+        # Scale factor for 40px icons (drawn on a 32px grid)
         s = 1.25
-        
+
         if name == "pen":
             painter.drawLine(int(10*s), int(22*s), int(13*s), int(22*s))
             painter.drawLine(int(10*s), int(22*s), int(22*s), int(10*s))
             painter.drawLine(int(13*s), int(22*s), int(25*s), int(13*s))
             painter.drawLine(int(22*s), int(10*s), int(25*s), int(13*s))
             painter.drawLine(int(10*s), int(22*s), int(8*s), int(24*s))
-            
+
         elif name == "line":
             painter.drawLine(int(8*s), int(24*s), int(24*s), int(8*s))
-            
+
         elif name == "arrow":
             painter.drawLine(int(8*s), int(24*s), int(24*s), int(8*s))
             painter.drawLine(int(24*s), int(8*s), int(16*s), int(8*s))
             painter.drawLine(int(24*s), int(8*s), int(24*s), int(16*s))
-            
+
         elif name == "rectangle":
             painter.drawRect(int(8*s), int(10*s), int(16*s), int(12*s))
-            
+
         elif name == "circle":
-            painter.drawEllipse(int(8*s), int(8*s), int(16*s), int(16*s))
-            
+            painter.drawEllipse(int(8*s), int(9*s), int(16*s), int(14*s))
+
         elif name == "highlighter":
             pen.setWidth(8)
             pen.setCapStyle(Qt.PenCapStyle.FlatCap)
@@ -115,13 +112,28 @@ class IconFactory:
                 pen.setColor(c)
             painter.setPen(pen)
             painter.drawLine(int(8*s), int(20*s), int(24*s), int(12*s))
-            
+
         elif name == "text":
             font = QFont("Georgia", 16, QFont.Weight.Bold)
             painter.setFont(font)
             painter.setPen(color)
             painter.drawText(QRect(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, "T")
-            
+
+        elif name == "blur":
+            # Mosaic: a 3x3 checker of filled squares
+            painter.setPen(Qt.PenStyle.NoPen)
+            cell = int(5 * s)
+            x0, y0 = int(8.5 * s), int(8.5 * s)
+            for r in range(3):
+                for c in range(3):
+                    if (r + c) % 2 == 0:
+                        painter.setBrush(color)
+                    else:
+                        cc = QColor(color)
+                        cc.setAlpha(90)
+                        painter.setBrush(cc)
+                    painter.drawRect(x0 + c * cell, y0 + r * cell, cell - 1, cell - 1)
+
         elif name == "undo":
             path = QPainterPath()
             path.moveTo(22*s, 12*s)
@@ -130,18 +142,27 @@ class IconFactory:
             painter.drawPath(path)
             painter.drawLine(int(22*s), int(12*s), int(18*s), int(8*s))
             painter.drawLine(int(22*s), int(12*s), int(18*s), int(16*s))
-            
+
+        elif name == "redo":
+            path = QPainterPath()
+            path.moveTo(10*s, 12*s)
+            path.quadTo(16*s, 12*s, 20*s, 16*s)
+            path.quadTo(20*s, 22*s, 14*s, 24*s)
+            painter.drawPath(path)
+            painter.drawLine(int(10*s), int(12*s), int(14*s), int(8*s))
+            painter.drawLine(int(10*s), int(12*s), int(14*s), int(16*s))
+
         elif name == "copy":
             painter.drawRect(int(14*s), int(8*s), int(12*s), int(14*s))
             painter.drawLine(int(10*s), int(12*s), int(10*s), int(28*s))
             painter.drawLine(int(10*s), int(28*s), int(22*s), int(28*s))
-            
+
         elif name == "save":
             painter.drawRect(int(8*s), int(6*s), int(18*s), int(22*s))
             painter.drawLine(int(12*s), int(6*s), int(12*s), int(14*s))
             painter.drawLine(int(24*s), int(6*s), int(24*s), int(14*s))
             painter.drawLine(int(12*s), int(14*s), int(24*s), int(14*s))
-            
+
         elif name == "close":
             painter.drawLine(int(12*s), int(12*s), int(26*s), int(26*s))
             painter.drawLine(int(26*s), int(12*s), int(12*s), int(26*s))
@@ -150,19 +171,14 @@ class IconFactory:
             # Viewfinder-style record icon with red dot
             painter.setPen(QPen(color, 2 * s))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            # Top-left corner bracket
             painter.drawLine(int(4*s), int(4*s), int(11*s), int(4*s))
             painter.drawLine(int(4*s), int(4*s), int(4*s), int(11*s))
-            # Top-right corner bracket
             painter.drawLine(int(21*s), int(4*s), int(28*s), int(4*s))
             painter.drawLine(int(28*s), int(4*s), int(28*s), int(11*s))
-            # Bottom-left corner bracket
             painter.drawLine(int(4*s), int(21*s), int(4*s), int(28*s))
             painter.drawLine(int(4*s), int(28*s), int(11*s), int(28*s))
-            # Bottom-right corner bracket
             painter.drawLine(int(28*s), int(21*s), int(28*s), int(28*s))
             painter.drawLine(int(21*s), int(28*s), int(28*s), int(28*s))
-            # Red filled circle in center
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor("#e63946"))
             painter.drawEllipse(int(10*s), int(10*s), int(12*s), int(12*s))
@@ -172,47 +188,45 @@ class IconFactory:
 
 
 class HoverButton(QToolButton):
-    """Button that turns blue on hover"""
+    """Toolbar button: clean ink at rest, brand purple on hover / when checked."""
+
     def __init__(self, icon_name: str, tooltip: str, parent=None):
         super().__init__(parent)
         self.icon_name = icon_name
         self.setToolTip(tooltip)
         self.setFixedSize(40, 40)
         self.setCheckable(True)
-        
-        # FIX 1: Explicitly force Arrow Cursor on the button itself
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        
-        # Pre-generate icons — clean ink at rest, brand purple when active.
-        self.icon_normal = IconFactory.create_icon(icon_name, QColor("#3C3C43"))
-        self.icon_active = IconFactory.create_icon(icon_name, QColor("#7A1FA6"))
+
+        self.icon_normal = IconFactory.create_icon(icon_name, QColor(INK_SOFT))
+        self.icon_active = IconFactory.create_icon(icon_name, QColor(BRAND_PURPLE))
 
         self.setIcon(self.icon_normal)
         self.setIconSize(QSize(40, 40))
 
-        self.setStyleSheet("""
-            QToolButton {
+        self.setStyleSheet(f"""
+            QToolButton {{
                 background: transparent;
                 border: none;
                 border-radius: 9px;
-            }
-            QToolButton:hover {
+            }}
+            QToolButton:hover {{
                 background: #F2F2F7;
-            }
-            QToolButton:checked {
-                background: #EFE8FB;
-            }
+            }}
+            QToolButton:checked {{
+                background: {BRAND_PURPLE_SOFT};
+            }}
         """)
-        
+
     def enterEvent(self, event):
         self.setIcon(self.icon_active)
         super().enterEvent(event)
-        
+
     def leaveEvent(self, event):
         if not self.isChecked():
             self.setIcon(self.icon_normal)
         super().leaveEvent(event)
-        
+
     def checkStateSet(self):
         if self.isChecked():
             self.setIcon(self.icon_active)
@@ -228,9 +242,10 @@ _PALETTE_COLORS = [
     "#ffeaa7", "#dfe6e9", "#a29bfe", "#fd79a8", "#636e72", "#b2bec3",
 ]
 
+
 class _ColorPickerPopup(QDialog):
-    """Color picker popup: native macOS Colors (round wheel, tabs) + hex, copy, default.
-    Keeps the sidebar slim — only the swatch is visible until clicked.
+    """Color picker popup: quick palette + hex + native dialog + "use as default".
+    Keeps the sidebar slim - only the swatch is visible until clicked.
     """
     def __init__(self, initial_color: QColor, parent=None):
         super().__init__(parent)
@@ -247,8 +262,7 @@ class _ColorPickerPopup(QDialog):
         layout.setSpacing(10)
         layout.setContentsMargins(12, 12, 12, 12)
 
-        # Open native macOS Colors (round wheel, sliders, palettes tabs)
-        open_btn = QPushButton("Open color picker…", self)
+        open_btn = QPushButton("Open color picker...", self)
         open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         open_btn.setStyleSheet("""
             QPushButton {
@@ -260,7 +274,6 @@ class _ColorPickerPopup(QDialog):
         open_btn.clicked.connect(self._open_native_picker)
         layout.addWidget(open_btn)
 
-        # Quick-pick palette
         palette_label = QLabel("Quick colors", self)
         palette_label.setStyleSheet("font-size: 10px; color: #555;")
         layout.addWidget(palette_label)
@@ -283,7 +296,6 @@ class _ColorPickerPopup(QDialog):
         palette_layout.addStretch()
         layout.addLayout(palette_layout)
 
-        # Current color swatch + hex + copy
         row = QHBoxLayout()
         swatch = QToolButton(self)
         swatch.setFixedSize(28, 28)
@@ -296,6 +308,7 @@ class _ColorPickerPopup(QDialog):
         self._hex_edit.setMaxLength(7)
         self._hex_edit.setFixedWidth(90)
         self._hex_edit.returnPressed.connect(self._apply_hex)
+        self._hex_edit.editingFinished.connect(self._apply_hex)
         row.addWidget(self._hex_edit)
 
         copy_btn = QPushButton("Copy", self)
@@ -305,17 +318,15 @@ class _ColorPickerPopup(QDialog):
         row.addStretch()
         layout.addLayout(row)
 
-        # Default checkbox
-        cfg = _load_config()
-        is_default = cfg.get("default_color", "").upper() == self._current.name().upper()
+        is_default = str(app_config.get("default_color", "")).upper() == self._current.name().upper()
         self._default_cb = QCheckBox("Use as default for next session", self)
         self._default_cb.setChecked(is_default)
         layout.addWidget(self._default_cb)
 
-        # OK / Cancel
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         ok_btn = QPushButton("OK", self)
+        ok_btn.setDefault(True)
         ok_btn.clicked.connect(self._on_ok)
         cancel_btn = QPushButton("Cancel", self)
         cancel_btn.clicked.connect(self.reject)
@@ -334,25 +345,22 @@ class _ColorPickerPopup(QDialog):
             }}
         """)
 
+    def _set_current(self, c: QColor):
+        self._current = c
+        self._hex_edit.blockSignals(True)
+        self._hex_edit.setText(c.name().upper())
+        self._hex_edit.blockSignals(False)
+        self._update_swatch()
+
     def _open_native_picker(self):
-        """Open native macOS Colors window (round wheel, tabs)."""
         color = QColorDialog.getColor(self._current, self, "Colors")
         if color.isValid():
-            self._current = color
-            self._hex_edit.blockSignals(True)
-            self._hex_edit.setText(color.name().upper())
-            self._hex_edit.blockSignals(False)
-            self._update_swatch()
+            self._set_current(color)
 
     def _pick_palette(self, hex_val: str):
-        """One-click select from palette."""
         c = QColor(hex_val)
         if c.isValid():
-            self._current = c
-            self._hex_edit.blockSignals(True)
-            self._hex_edit.setText(c.name().upper())
-            self._hex_edit.blockSignals(False)
-            self._update_swatch()
+            self._set_current(c)
 
     def _apply_hex(self):
         text = self._hex_edit.text().strip()
@@ -368,14 +376,9 @@ class _ColorPickerPopup(QDialog):
         QApplication.clipboard().setText(self._current.name().upper())
 
     def _on_ok(self):
+        self._apply_hex()
         if self._default_cb.isChecked():
-            cfg = _load_config()
-            cfg["default_color"] = self._current.name().upper()
-            _save_config(cfg)
-        else:
-            cfg = _load_config()
-            cfg.pop("default_color", None)
-            _save_config(cfg)
+            app_config.set_value("default_color", self._current.name().upper())
         self.selected_color = self._current
         self.accept()
 
@@ -386,64 +389,88 @@ class OverlayWindow(QWidget):
     image_copied = pyqtSignal()
     image_saved = pyqtSignal(str)
     recording_requested = pyqtSignal(QRect)
-    
-    def __init__(self, screenshot: Image.Image, offset_x: int = 0, offset_y: int = 0, capture_dpr: float = 1.0):
+
+    # Tools shown in the vertical toolbar, top to bottom.
+    TOOLS = [
+        ("pen", "Pen", "pen"),
+        ("line", "Line", "line"),
+        ("arrow", "Arrow", "arrow"),
+        ("rectangle", "Rectangle", "rectangle"),
+        ("circle", "Ellipse", "circle"),
+        ("highlighter", "Highlighter", "highlighter"),
+        ("blur", "Blur (hide sensitive info)", "blur"),
+        ("text", "Text (click, type, Enter)", "text"),
+    ]
+
+    def __init__(self, screenshot: Image.Image, offset_x: int = 0, offset_y: int = 0,
+                 capture_dpr: float = 1.0):
         super().__init__()
         self.offset_x = offset_x
         self.offset_y = offset_y
-        self.capture_dpr = capture_dpr
+        self.capture_dpr = float(capture_dpr) if capture_dpr else 1.0
 
-        self.screenshot = self._pil_to_pixmap(screenshot)
         self.original_image = screenshot
-        
+        self.screenshot = self._pil_to_pixmap(screenshot)
+        # Physical pixels tagged with the capture ratio: Qt draws the pixmap
+        # at LOGICAL size (crisp on 150% Windows / Retina) without any manual
+        # scaling in paintEvent.
+        self.screenshot.setDevicePixelRatio(self.capture_dpr)
+        self._pixelated = None  # built lazily by the blur tool
+
         self.start_point = None
         self.current_point = None
         self.selection_rect: QRect | None = None
         self.selection_complete = False
         self.resize_mode = ResizeMode.NONE
-        
+        self.origin_rect = None
+
         self.current_tool = None
-        # Load default color from config, fall back to black
-        cfg = _load_config()
-        default_hex = cfg.get("default_color", "#000000")
+        default_hex = app_config.get("default_color", "#000000") or "#000000"
         self.current_color = QColor(default_hex)
+        if not self.current_color.isValid():
+            self.current_color = QColor("#000000")
         self.actions = []
-        
+        self._redo_stack = []
+
         self.tool_toolbar = None
         self.action_toolbar = None
         self.tool_group = None
-        
+        self.tool_buttons = {}
+
         # Inline text editing state
         self.text_editing = False
-        self.text_position = None  # QPoint where text is being typed
-        self.text_content = ""  # Current text being typed
-        self.text_cursor_visible = True  # For blinking cursor
-        self.editing_action_index = None  # Index of action being edited (None = new text)
-        
+        self.text_position = None
+        self.text_content = ""
+        self.editing_action_index = None
+
         self._setup_window()
-        
+
+    # ------------------------------------------------------------------ setup
+
     def _pil_to_pixmap(self, pil_image: Image.Image) -> QPixmap:
         if pil_image.mode != "RGBA":
             pil_image = pil_image.convert("RGBA")
         data = pil_image.tobytes("raw", "RGBA")
-        qimage = QImage(data, pil_image.width, pil_image.height, QImage.Format.Format_RGBA8888).copy()
+        qimage = QImage(data, pil_image.width, pil_image.height,
+                        QImage.Format.Format_RGBA8888).copy()
         return QPixmap.fromImage(qimage)
-    
+
+    def _logical_size(self):
+        """Screen size in logical pixels (what the widget covers)."""
+        return (int(round(self.screenshot.width() / self.capture_dpr)),
+                int(round(self.screenshot.height() / self.capture_dpr)))
+
     def _setup_window(self):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.Tool
         )
-        self.setGeometry(
-            self.offset_x,
-            self.offset_y,
-            self.screenshot.width(),
-            self.screenshot.height()
-        )
+        w, h = self._logical_size()
+        self.setGeometry(self.offset_x, self.offset_y, w, h)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
-        # Must be focusable or keyPressEvent (Esc / ⌘C / ⌘S / ⌘Z) never fires.
+        # Must be focusable or keyPressEvent (Esc / Ctrl+C / Ctrl+S / Ctrl+Z) never fires.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def _add_card_shadow(self, widget):
@@ -454,48 +481,41 @@ class OverlayWindow(QWidget):
         eff.setOffset(0, 8)
         widget.setGraphicsEffect(eff)
 
+    def _card_style(self):
+        return f"""
+            QFrame {{
+                background: #FFFFFF;
+                border: 1px solid {CARD_BORDER};
+                border-radius: 18px;
+            }}
+        """
+
     def _create_toolbars(self):
         # Vertical Toolbar (Tools)
         self.tool_toolbar = QFrame(self)
-        # FIX 2: Explicitly force Arrow Cursor on the toolbar frame
         self.tool_toolbar.setCursor(Qt.CursorShape.ArrowCursor)
-        
-        self.tool_toolbar.setStyleSheet("""
-            QFrame {
-                background: #FFFFFF;
-                border: 1px solid #E5E5EA;
-                border-radius: 18px;
-            }
-        """)
+        self.tool_toolbar.setStyleSheet(self._card_style())
         self._add_card_shadow(self.tool_toolbar)
 
         tool_layout = QVBoxLayout(self.tool_toolbar)
         tool_layout.setContentsMargins(6, 6, 6, 6)
         tool_layout.setSpacing(3)
-        
+
         self.tool_group = QButtonGroup(self)
         self.tool_group.setExclusive(True)
-        
-        tools = [
-            ("pen", "Pen", "pen"),
-            ("line", "Line", "line"),
-            ("arrow", "Arrow", "arrow"),
-            ("rectangle", "Rectangle", "rectangle"),
-            ("highlighter", "Highlighter", "highlighter"),
-            ("text", "Text", "text"),
-        ]
-        
+
         self.tool_buttons = {}
-        for icon_key, tooltip, tool_id in tools:
+        for icon_key, tooltip, tool_id in self.TOOLS:
             btn = HoverButton(icon_key, tooltip, self.tool_toolbar)
             btn.setProperty("tool_id", tool_id)
             self.tool_group.addButton(btn)
             self.tool_buttons[tool_id] = btn
             tool_layout.addWidget(btn)
-            
-        # Color swatch only — hex, copy, Default move to popup on click
+
+        # Color swatch only - palette, hex and "default" live in the popup
         self.color_btn = QToolButton(self.tool_toolbar)
         self.color_btn.setFixedSize(24, 24)
+        self.color_btn.setToolTip("Color")
         self.color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._update_color_button()
         self.color_btn.clicked.connect(self._pick_color)
@@ -506,78 +526,73 @@ class OverlayWindow(QWidget):
         color_layout.setSpacing(2)
         color_layout.addWidget(self.color_btn, 0, Qt.AlignmentFlag.AlignCenter)
         tool_layout.addWidget(color_container)
-        
-        # Undo
-        undo_btn = HoverButton("undo", "Undo", self.tool_toolbar)
+
+        undo_btn = HoverButton("undo", "Undo (Ctrl+Z)", self.tool_toolbar)
         undo_btn.setCheckable(False)
         undo_btn.clicked.connect(self._undo)
         tool_layout.addWidget(undo_btn)
-        
+
+        redo_btn = HoverButton("redo", "Redo (Ctrl+Y)", self.tool_toolbar)
+        redo_btn.setCheckable(False)
+        redo_btn.clicked.connect(self._redo)
+        tool_layout.addWidget(redo_btn)
+
         self.tool_toolbar.adjustSize()
         self.tool_group.buttonClicked.connect(self._on_tool_selected)
-        
+
         # Horizontal Toolbar (Actions)
         self.action_toolbar = QFrame(self)
-        # FIX 3: Explicitly force Arrow Cursor on the action toolbar
         self.action_toolbar.setCursor(Qt.CursorShape.ArrowCursor)
-        
-        self.action_toolbar.setStyleSheet("""
-            QFrame {
-                background: #FFFFFF;
-                border: 1px solid #E5E5EA;
-                border-radius: 18px;
-            }
-        """)
+        self.action_toolbar.setStyleSheet(self._card_style())
         self._add_card_shadow(self.action_toolbar)
 
         action_layout = QHBoxLayout(self.action_toolbar)
         action_layout.setContentsMargins(6, 6, 6, 6)
         action_layout.setSpacing(3)
-        
+
         actions = [
-            ("record", "Record Screen", self._record),
-            ("copy", "Copy", self._copy),
-            ("save", "Save", self._save),
-            ("close", "Close", self._cancel),
+            ("record", "Record this area (video)", self._record),
+            ("copy", "Copy to clipboard (Enter)", self._copy),
+            ("save", "Save as file (Ctrl+S)", self._save),
+            ("close", "Close (Esc)", self._cancel),
         ]
-        
         for icon_key, tooltip, callback in actions:
             btn = HoverButton(icon_key, tooltip, self.action_toolbar)
             btn.setCheckable(False)
             btn.clicked.connect(callback)
             action_layout.addWidget(btn)
-            
+
         self.action_toolbar.adjustSize()
         self._position_toolbars()
-        
+
     def _position_toolbars(self):
         if not self.selection_rect or not self.tool_toolbar:
             return
-            
+
         rect = self.selection_rect
         margin = 5
-        
+
         tx = rect.right() + margin
         ty = rect.top()
-        
         if tx + self.tool_toolbar.width() > self.width():
             tx = rect.left() - self.tool_toolbar.width() - margin
-            
+        if tx < 0:
+            tx = max(margin, rect.right() - self.tool_toolbar.width() - margin)
         if ty + self.tool_toolbar.height() > self.height():
             ty = self.height() - self.tool_toolbar.height() - margin
-        if ty < 0: ty = margin
-            
+        if ty < 0:
+            ty = margin
         self.tool_toolbar.move(tx, ty)
         self.tool_toolbar.show()
-        
+
         ax = rect.right() - self.action_toolbar.width()
         ay = rect.bottom() + margin
-        
         if ay + self.action_toolbar.height() > self.height():
             ay = rect.top() - self.action_toolbar.height() - margin
-            
-        if ax < 0: ax = margin
-            
+        if ay < 0:
+            ay = max(margin, rect.bottom() - self.action_toolbar.height() - margin)
+        if ax < 0:
+            ax = margin
         self.action_toolbar.move(ax, ay)
         self.action_toolbar.show()
 
@@ -586,7 +601,7 @@ class OverlayWindow(QWidget):
             QToolButton {{
                 background-color: {self.current_color.name()};
                 border: 1px solid #999;
-                border-radius: 0px;
+                border-radius: 12px;
             }}
         """)
 
@@ -595,8 +610,9 @@ class OverlayWindow(QWidget):
 
         The overlay normally sits at level 25 (above normal windows) so it
         covers everything during capture. But that also hides any child
-        dialog — like the color picker — *behind* it. We drop the level
-        while a dialog is open, then restore it.
+        dialog - like the color picker - behind it. We drop the level while
+        a dialog is open, then restore it. No-op on Windows (child dialogs
+        stack above their parent there).
         """
         if not IS_MACOS:
             return
@@ -613,10 +629,6 @@ class OverlayWindow(QWidget):
             print(f"_set_overlay_level: {e}")
 
     def _pick_color(self):
-        # Drop the overlay below normal level so the picker popup (and the
-        # native Apple Colors panel it can open) appear ABOVE it and stay
-        # clickable. Without this the picker opens hidden behind the
-        # full-screen overlay and nothing seems to happen.
         self._set_overlay_level(0)
         try:
             popup = _ColorPickerPopup(self.current_color, self)
@@ -624,7 +636,7 @@ class OverlayWindow(QWidget):
             if popup.exec() == QDialog.DialogCode.Accepted and popup.selected_color.isValid():
                 self.current_color = popup.selected_color
                 self._update_color_button()
-                if self.current_tool:
+                if self.current_tool and not isinstance(self.current_tool, HighlighterTool):
                     self.current_tool.color = self.current_color
         finally:
             self._set_overlay_level(25)
@@ -637,52 +649,65 @@ class OverlayWindow(QWidget):
         tool_id = button.property("tool_id")
         tool_map = {
             "pen": PenTool, "line": LineTool, "arrow": ArrowTool,
-            "rectangle": RectangleTool, "highlighter": HighlighterTool, "text": TextTool
+            "rectangle": RectangleTool, "circle": CircleTool,
+            "highlighter": HighlighterTool, "blur": BlurTool, "text": TextTool,
         }
-        
         tool_class = tool_map.get(tool_id)
         if tool_class:
             if tool_id == "highlighter":
                 self.current_tool = tool_class(QColor(255, 255, 0), 20)
             else:
                 self.current_tool = tool_class(self.current_color)
-            
             if tool_id == "text":
                 self.setCursor(Qt.CursorShape.IBeamCursor)
             else:
                 self.setCursor(Qt.CursorShape.CrossCursor)
 
     def _undo(self):
+        if self.text_editing:
+            self._finish_text_editing()
         if self.actions:
-            self.actions.pop()
+            self._redo_stack.append(self.actions.pop())
             self.update()
 
-    # --- Hit Testing & Interaction ---
-    
-    def _get_hit_test(self, pos: QPoint):
-        # FIX 4: Safety Check - if over toolbar, ignore resize logic completely
-        if (self.tool_toolbar and self.tool_toolbar.isVisible() and self.tool_toolbar.geometry().contains(pos)) or \
-           (self.action_toolbar and self.action_toolbar.isVisible() and self.action_toolbar.geometry().contains(pos)):
-            return ResizeMode.NONE
+    def _redo(self):
+        if self._redo_stack:
+            self.actions.append(self._redo_stack.pop())
+            self.update()
 
+    def _push_action(self, action):
+        self.actions.append(action)
+        self._redo_stack.clear()
+
+    # ------------------------------------------------- hit testing / mouse
+
+    def _over_toolbar(self, pos: QPoint) -> bool:
+        for tb in (self.tool_toolbar, self.action_toolbar):
+            if tb and tb.isVisible() and tb.geometry().contains(pos):
+                return True
+        return False
+
+    def _get_hit_test(self, pos: QPoint):
+        if self._over_toolbar(pos):
+            return ResizeMode.NONE
         if not self.selection_rect:
             return ResizeMode.NONE
-            
+
         r = self.selection_rect
         x, y, w, h = r.x(), r.y(), r.width(), r.height()
         hs = HANDLE_SIZE
         hw = hs // 2
-        
+
         tl = QRect(x - hw, y - hw, hs, hs)
         tr = QRect(x + w - hw, y - hw, hs, hs)
         bl = QRect(x - hw, y + h - hw, hs, hs)
         br = QRect(x + w - hw, y + h - hw, hs, hs)
-        
-        t  = QRect(x + hw, y - hw, w - hs, hs)
-        b  = QRect(x + hw, y + h - hw, w - hs, hs)
-        l  = QRect(x - hw, y + hw, hs, h - hs)
+
+        t = QRect(x + hw, y - hw, w - hs, hs)
+        b = QRect(x + hw, y + h - hw, w - hs, hs)
+        l = QRect(x - hw, y + hw, hs, h - hs)
         ri = QRect(x + w - hw, y + hw, hs, h - hs)
-        
+
         if tl.contains(pos): return ResizeMode.TOP_LEFT
         if tr.contains(pos): return ResizeMode.TOP_RIGHT
         if bl.contains(pos): return ResizeMode.BOTTOM_LEFT
@@ -692,21 +717,16 @@ class OverlayWindow(QWidget):
         if l.contains(pos): return ResizeMode.LEFT
         if ri.contains(pos): return ResizeMode.RIGHT
         if r.contains(pos): return ResizeMode.MOVE
-        
         return ResizeMode.NONE
 
     def _update_cursor(self, pos: QPoint):
         if self.resize_mode != ResizeMode.NONE and self.start_point:
             return
-            
-        # FIX 5: Explicitly check toolbar overlap again
-        if (self.tool_toolbar and self.tool_toolbar.isVisible() and self.tool_toolbar.geometry().contains(pos)) or \
-           (self.action_toolbar and self.action_toolbar.isVisible() and self.action_toolbar.geometry().contains(pos)):
+        if self._over_toolbar(pos):
             self.setCursor(Qt.CursorShape.ArrowCursor)
             return
 
         mode = self._get_hit_test(pos)
-        
         if self.current_tool and mode == ResizeMode.MOVE:
             if isinstance(self.current_tool, TextTool):
                 self.setCursor(Qt.CursorShape.IBeamCursor)
@@ -729,149 +749,141 @@ class OverlayWindow(QWidget):
         self.setCursor(cursor_map.get(mode, Qt.CursorShape.ArrowCursor))
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            # Finish any ongoing text editing first
-            if self.text_editing:
-                self._finish_text_editing()
-            
-            self.start_point = event.pos()
-            self.current_point = event.pos()
-            
-            hit = self._get_hit_test(event.pos())
-            
-            if self.selection_complete:
-                if hit != ResizeMode.NONE and hit != ResizeMode.MOVE:
-                    self.resize_mode = hit
-                    self.origin_rect = QRect(self.selection_rect)
-                    
-                elif hit == ResizeMode.MOVE:
-                    if self.current_tool:
-                        self.resize_mode = ResizeMode.NONE
-                        if isinstance(self.current_tool, TextTool):
-                            self._add_text(event.pos())
-                        else:
-                            self.current_tool.on_mouse_press(event.pos())
-                    else:
-                        self.resize_mode = ResizeMode.MOVE
-                        self.origin_rect = QRect(self.selection_rect)
-                else:
-                    self.selection_complete = False
-                    self.selection_rect = None
-                    self.tool_toolbar.hide()
-                    self.action_toolbar.hide()
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self.text_editing:
+            self._finish_text_editing()
+
+        self.start_point = event.pos()
+        self.current_point = event.pos()
+        hit = self._get_hit_test(event.pos())
+
+        if self.selection_complete:
+            if hit != ResizeMode.NONE and hit != ResizeMode.MOVE:
+                self.resize_mode = hit
+                self.origin_rect = QRect(self.selection_rect)
+            elif hit == ResizeMode.MOVE:
+                if self.current_tool:
                     self.resize_mode = ResizeMode.NONE
-                    self.tool_group.setExclusive(False)
-                    for btn in self.tool_buttons.values(): btn.setChecked(False)
-                    self.tool_group.setExclusive(True)
-                    self.current_tool = None
+                    if isinstance(self.current_tool, TextTool):
+                        self._add_text(event.pos())
+                    else:
+                        self.current_tool.on_mouse_press(event.pos())
+                else:
+                    self.resize_mode = ResizeMode.MOVE
+                    self.origin_rect = QRect(self.selection_rect)
             else:
+                # Click outside the selection: start a fresh one
+                self.selection_complete = False
+                self.selection_rect = None
+                self.tool_toolbar.hide()
+                self.action_toolbar.hide()
                 self.resize_mode = ResizeMode.NONE
-                
-            self.update()
+                self.tool_group.setExclusive(False)
+                for btn in self.tool_buttons.values():
+                    btn.setChecked(False)
+                self.tool_group.setExclusive(True)
+                self.current_tool = None
+                self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.resize_mode = ResizeMode.NONE
+        self.update()
 
     def mouseMoveEvent(self, event):
         self.current_point = event.pos()
         self._update_cursor(event.pos())
-        
-        if self.start_point:
-            if not self.selection_complete:
-                self.selection_rect = QRect(self.start_point, self.current_point).normalized()
-                self.update()
-                return
 
-            if self.resize_mode == ResizeMode.NONE and self.current_tool:
-                self.current_tool.on_mouse_move(event.pos())
-                self.update()
-                return
-                
-            if self.resize_mode == ResizeMode.MOVE:
-                dx = self.current_point.x() - self.start_point.x()
-                dy = self.current_point.y() - self.start_point.y()
-                self.selection_rect = self.origin_rect.translated(dx, dy)
-                self._position_toolbars()
-                self.update()
-                
-            elif self.resize_mode != ResizeMode.NONE:
-                r = QRect(self.origin_rect)
-                dx = self.current_point.x() - self.start_point.x()
-                dy = self.current_point.y() - self.start_point.y()
-                
-                if self.resize_mode == ResizeMode.RIGHT: r.setRight(r.right() + dx)
-                elif self.resize_mode == ResizeMode.LEFT: r.setLeft(r.left() + dx)
-                elif self.resize_mode == ResizeMode.BOTTOM: r.setBottom(r.bottom() + dy)
-                elif self.resize_mode == ResizeMode.TOP: r.setTop(r.top() + dy)
-                elif self.resize_mode == ResizeMode.BOTTOM_RIGHT: 
-                    r.setRight(r.right() + dx)
-                    r.setBottom(r.bottom() + dy)
-                elif self.resize_mode == ResizeMode.TOP_LEFT:
-                    r.setLeft(r.left() + dx)
-                    r.setTop(r.top() + dy)
-                elif self.resize_mode == ResizeMode.TOP_RIGHT:
-                    r.setRight(r.right() + dx)
-                    r.setTop(r.top() + dy)
-                elif self.resize_mode == ResizeMode.BOTTOM_LEFT:
-                    r.setLeft(r.left() + dx)
-                    r.setBottom(r.bottom() + dy)
-                    
-                self.selection_rect = r.normalized()
-                self._position_toolbars()
-                self.update()
+        if not self.start_point:
+            return
+        if not self.selection_complete:
+            self.selection_rect = QRect(self.start_point, self.current_point).normalized()
+            self.update()
+            return
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            if not self.selection_complete:
-                if self.selection_rect and self.selection_rect.width() > 10 and self.selection_rect.height() > 10:
-                    self.selection_complete = True
-                    self._create_toolbars()
-                else:
-                    self.selection_rect = None
-                self.start_point = None
-                self.update()
-                return
-            
-            if self.resize_mode == ResizeMode.NONE and self.current_tool:
-                action = self.current_tool.on_mouse_release(event.pos())
-                if action:
-                    self.actions.append(action)
-            
-            self.start_point = None
-            self.resize_mode = ResizeMode.NONE
+        if self.resize_mode == ResizeMode.NONE and self.current_tool:
+            self.current_tool.on_mouse_move(event.pos())
+            self.update()
+            return
+
+        if self.resize_mode == ResizeMode.MOVE:
+            dx = self.current_point.x() - self.start_point.x()
+            dy = self.current_point.y() - self.start_point.y()
+            self.selection_rect = self.origin_rect.translated(dx, dy)
+            self._position_toolbars()
             self.update()
 
+        elif self.resize_mode != ResizeMode.NONE:
+            r = QRect(self.origin_rect)
+            dx = self.current_point.x() - self.start_point.x()
+            dy = self.current_point.y() - self.start_point.y()
+            m = self.resize_mode
+            if m in (ResizeMode.RIGHT, ResizeMode.BOTTOM_RIGHT, ResizeMode.TOP_RIGHT):
+                r.setRight(r.right() + dx)
+            if m in (ResizeMode.LEFT, ResizeMode.TOP_LEFT, ResizeMode.BOTTOM_LEFT):
+                r.setLeft(r.left() + dx)
+            if m in (ResizeMode.BOTTOM, ResizeMode.BOTTOM_RIGHT, ResizeMode.BOTTOM_LEFT):
+                r.setBottom(r.bottom() + dy)
+            if m in (ResizeMode.TOP, ResizeMode.TOP_LEFT, ResizeMode.TOP_RIGHT):
+                r.setTop(r.top() + dy)
+            self.selection_rect = r.normalized()
+            self._position_toolbars()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if not self.selection_complete:
+            if (self.selection_rect and self.selection_rect.width() > MIN_SELECTION
+                    and self.selection_rect.height() > MIN_SELECTION):
+                self.selection_complete = True
+                if self.tool_toolbar is None:
+                    self._create_toolbars()
+                else:
+                    self._position_toolbars()
+            else:
+                self.selection_rect = None
+            self.start_point = None
+            self.update()
+            return
+
+        if self.resize_mode == ResizeMode.NONE and self.current_tool:
+            action = self.current_tool.on_mouse_release(event.pos())
+            if action:
+                self._push_action(action)
+
+        self.start_point = None
+        self.resize_mode = ResizeMode.NONE
+        self.update()
+
+    # -------------------------------------------------------------- text
+
+    def _text_font(self, size=18):
+        return QFont(SYSTEM_FONT, size, QFont.Weight.Bold)
+
     def _add_text(self, point):
-        """Start inline text editing at the clicked point, or edit existing text if clicked on it"""
-        from PyQt6.QtGui import QFontMetrics
-        
-        # Check if clicking on an existing text action (reverse order to select topmost)
+        """Start inline text editing at the clicked point, or edit existing text if clicked on it."""
         for i in range(len(self.actions) - 1, -1, -1):
             action = self.actions[i]
             if action.tool_type == "text" and action.points and action.text:
                 text_pos = action.points[0]
-                # Create bounding box using same font as rendering
-                font = QFont(SYSTEM_FONT, action.font_size or 18, QFont.Weight.Bold)
-                metrics = QFontMetrics(font)
+                metrics = QFontMetrics(self._text_font(action.font_size or 18))
                 text_width = metrics.horizontalAdvance(action.text)
                 text_height = metrics.height()
-                
-                # Larger hit area for easier clicking
                 padding = 8
                 hit_rect = QRect(
-                    text_pos.x() - padding, 
-                    text_pos.y() - text_height - padding, 
-                    text_width + padding * 2, 
+                    text_pos.x() - padding,
+                    text_pos.y() - text_height - padding,
+                    text_width + padding * 2,
                     text_height + padding * 2
                 )
-                
                 if hit_rect.contains(point):
-                    # Edit existing text
                     self.text_editing = True
                     self.text_position = text_pos
                     self.text_content = action.text
                     self.editing_action_index = i
                     self.update()
                     return
-        
-        # Start new text at clicked position
+
         self.text_editing = True
         self.text_position = point
         self.text_content = ""
@@ -879,100 +891,106 @@ class OverlayWindow(QWidget):
         self.update()
 
     def _finish_text_editing(self):
-        """Finish text editing and save the text as an action"""
+        """Finish text editing and save the text as an action."""
         if not self.text_editing:
             return
-            
         if self.text_content.strip():
             if self.editing_action_index is not None:
-                # Update existing action
                 self.actions[self.editing_action_index].text = self.text_content
             else:
-                # Create new action
-                self.actions.append(DrawingAction(
-                    tool_type="text", 
-                    color=self.current_color, 
-                    points=[self.text_position], 
-                    text=self.text_content, 
+                self._push_action(DrawingAction(
+                    tool_type="text",
+                    color=QColor(self.current_color),
+                    points=[QPoint(self.text_position)],
+                    text=self.text_content,
                     font_size=18
                 ))
-        elif self.editing_action_index is not None and not self.text_content.strip():
-            # If editing existing and text is empty, remove it
+        elif self.editing_action_index is not None:
             del self.actions[self.editing_action_index]
-        
+
         self.text_editing = False
         self.text_position = None
         self.text_content = ""
         self.editing_action_index = None
         self.update()
 
+    # ----------------------------------------------------------- painting
+
+    def _blur_source(self) -> QPixmap:
+        """Pixelated copy of the screenshot (built once, same DPR tag)."""
+        if self._pixelated is None:
+            img = self.screenshot.toImage()
+            block = max(4, int(round(12 * self.capture_dpr)))  # mosaic cell in physical px
+            small = img.scaled(max(1, img.width() // block), max(1, img.height() // block),
+                               Qt.AspectRatioMode.IgnoreAspectRatio,
+                               Qt.TransformationMode.FastTransformation)
+            big = small.scaled(img.width(), img.height(),
+                               Qt.AspectRatioMode.IgnoreAspectRatio,
+                               Qt.TransformationMode.FastTransformation)
+            pm = QPixmap.fromImage(big)
+            pm.setDevicePixelRatio(self.capture_dpr)
+            self._pixelated = pm
+        return self._pixelated
+
+    def _needs_blur_source(self):
+        if any(a.tool_type == "blur" for a in self.actions):
+            return True
+        return isinstance(self.current_tool, BlurTool)
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
+        # Frozen screen, dimmed
         painter.drawPixmap(0, 0, self.screenshot)
         painter.fillRect(self.rect(), QColor(0, 0, 0, 100))
-        
+
         if self.selection_rect:
             rect = self.selection_rect
-            
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
-            painter.fillRect(rect, Qt.GlobalColor.transparent)
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            
-            painter.drawPixmap(rect, self.screenshot, rect)
-            
+            blur_src = self._blur_source() if self._needs_blur_source() else None
+
+            # Undimmed selection: redraw the screenshot clipped to the rect
+            painter.save()
             painter.setClipRect(rect)
+            painter.drawPixmap(0, 0, self.screenshot)
+
             for i, action in enumerate(self.actions):
-                # Skip drawing the action that's currently being edited
                 if self.text_editing and self.editing_action_index == i:
                     continue
-                draw_action(painter, action)
-            
-            # Draw inline text being edited (with cursor)
+                draw_action(painter, action, blur_source=blur_src)
+
             if self.text_editing and self.text_position:
-                font = QFont(SYSTEM_FONT, 18, QFont.Weight.Bold)
-                painter.setFont(font)
+                painter.setFont(self._text_font(18))
                 painter.setPen(self.current_color)
-                
-                # Draw the text
-                text_to_draw = self.text_content
-                painter.drawText(self.text_position, text_to_draw)
-                
-                # Draw cursor (blinking line after text)
+                painter.drawText(self.text_position, self.text_content)
                 metrics = painter.fontMetrics()
-                text_width = metrics.horizontalAdvance(text_to_draw)
+                text_width = metrics.horizontalAdvance(self.text_content)
                 text_height = metrics.height()
                 cursor_x = self.text_position.x() + text_width + 1
                 cursor_y = self.text_position.y()
-                
-                # Draw cursor line
-                cursor_pen = QPen(self.current_color, 2)
-                painter.setPen(cursor_pen)
+                painter.setPen(QPen(self.current_color, 2))
                 painter.drawLine(cursor_x, cursor_y - text_height + 4, cursor_x, cursor_y + 3)
-            
-            if self.current_tool and self.start_point and self.resize_mode == ResizeMode.NONE and self.selection_complete:
+
+            if (self.current_tool and self.start_point and self.resize_mode == ResizeMode.NONE
+                    and self.selection_complete):
                 self.current_tool.draw_preview(painter)
-            
-            painter.setClipping(False)
-            
-            # Clean solid purple selection border (brand color), replacing the
-            # old dashed black/white outline.
-            painter.setPen(QPen(QColor("#7A1FA6"), 2))
+            painter.restore()
+
+            # Solid brand-purple selection border
+            painter.setPen(QPen(QColor(BRAND_PURPLE), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect)
 
             if self.selection_complete:
                 self._draw_handles(painter, rect)
-                self._draw_dimensions(painter, rect)
-        
+            self._draw_dimensions(painter, rect)
+
         elif not self.start_point:
             self._draw_instructions(painter)
 
     def _draw_handles(self, painter, rect):
         hs = HANDLE_SIZE
         hw = hs / 2
-        
         points = [
             rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight(),
             QPoint(rect.center().x(), rect.top()),
@@ -980,125 +998,146 @@ class OverlayWindow(QWidget):
             QPoint(rect.left(), rect.center().y()),
             QPoint(rect.right(), rect.center().y())
         ]
-        
-        painter.setPen(QColor(0,0,0, 50))
+        painter.setPen(QPen(QColor(BRAND_PURPLE), 1))
         painter.setBrush(Qt.GlobalColor.white)
-        
         for p in points:
             painter.drawRect(int(p.x() - hw), int(p.y() - hw), hs, hs)
 
     def _draw_dimensions(self, painter, rect):
-        text = f"{rect.width()} x {rect.height()}"
-        font = QFont("Arial", 9)
-        painter.setFont(font)
+        # Show the REAL pixel size of the image you will get.
+        pw = int(round(rect.width() * self.capture_dpr))
+        ph = int(round(rect.height() * self.capture_dpr))
+        text = f"{pw} x {ph}"
+        painter.setFont(QFont(SYSTEM_FONT, 9))
         metrics = painter.fontMetrics()
-        
-        x = rect.left()
-        y = rect.top() - 20
-        if y < 0: y = rect.top() + 5
-        
         t_rect = metrics.boundingRect(text)
-        painter.fillRect(x, y, t_rect.width() + 10, t_rect.height() + 5, QColor(0,0,0, 150))
-        
+        pad_x, pad_y = 7, 3
+        bw, bh = t_rect.width() + pad_x * 2, t_rect.height() + pad_y * 2
+
+        x = rect.left()
+        y = rect.top() - bh - 6
+        if y < 0:
+            y = rect.top() + 6
+        if x + bw > self.width():
+            x = self.width() - bw - 2
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 170))
+        painter.drawRoundedRect(x, y, bw, bh, 5, 5)
         painter.setPen(Qt.GlobalColor.white)
-        painter.drawText(x + 5, y + t_rect.height(), text)
+        painter.drawText(QRect(x, y, bw, bh), Qt.AlignmentFlag.AlignCenter, text)
 
     def _draw_instructions(self, painter):
-        text = "Select area"
-        font = QFont("Arial", 12)
-        painter.setFont(font)
-        metrics = painter.fontMetrics()
-        w = metrics.horizontalAdvance(text)
-        
-        x = (self.width() - w) // 2
-        y = 100
-        
-        painter.setPen(QColor(255,255,255, 100))
-        painter.drawText(x, y, text)
+        lines = [
+            ("Drag to select an area", 15, QFont.Weight.DemiBold),
+            ("Enter  copy      Ctrl+S  save      Esc  cancel", 10, QFont.Weight.Normal),
+        ]
+        widths, heights = [], []
+        for text, size, weight in lines:
+            painter.setFont(QFont(SYSTEM_FONT, size, weight))
+            m = painter.fontMetrics()
+            widths.append(m.horizontalAdvance(text))
+            heights.append(m.height())
+        bw = max(widths) + 44
+        bh = sum(heights) + 26
+        x = (self.width() - bw) // 2
+        y = 60
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(20, 20, 22, 200))
+        painter.drawRoundedRect(x, y, bw, bh, 14, 14)
+
+        cy = y + 13
+        for (text, size, weight), h in zip(lines, heights):
+            painter.setFont(QFont(SYSTEM_FONT, size, weight))
+            painter.setPen(QColor(255, 255, 255, 235 if size > 12 else 170))
+            painter.drawText(QRect(x, cy, bw, h), Qt.AlignmentFlag.AlignCenter, text)
+            cy += h
+
+    # ------------------------------------------------------------- output
 
     def _get_result_image(self) -> Image.Image:
         # Commit any text still being edited so it lands in the output.
-        # Clicking the Copy/Save toolbar buttons doesn't pass through the
-        # canvas mousePress that normally finalizes text, so without this
-        # a lone text annotation would be silently dropped.
         if self.text_editing:
             self._finish_text_editing()
-        if not self.selection_rect: return self.original_image
+        if not self.selection_rect:
+            return self.original_image
         rect = self.selection_rect
         dpr = self.capture_dpr
 
-        # Create result at full physical resolution
-        phys_w = int(rect.width() * dpr)
-        phys_h = int(rect.height() * dpr)
+        # Integer physical crop origin (avoids half-pixel resampling)
+        phys_x = int(round(rect.x() * dpr))
+        phys_y = int(round(rect.y() * dpr))
+        phys_w = max(1, int(round(rect.width() * dpr)))
+        phys_h = max(1, int(round(rect.height() * dpr)))
+
         result = QPixmap(phys_w, phys_h)
         result.fill(Qt.GlobalColor.transparent)
-
         painter = QPainter(result)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # Scale painter so logical drawing commands map to physical pixels
+        # Device pixels: shift so the crop lands at (0, 0), then draw in
+        # logical units. The DPR-tagged pixmap maps 1:1 onto device pixels.
+        painter.translate(-phys_x, -phys_y)
         painter.scale(dpr, dpr)
+        painter.drawPixmap(0, 0, self.screenshot)
 
-        # Draw the screenshot region at physical resolution
-        src_rect = QRect(
-            int(rect.x() * dpr), int(rect.y() * dpr),
-            phys_w, phys_h
-        )
-        painter.drawPixmap(0, 0, rect.width(), rect.height(),
-                           self.screenshot, src_rect.x(), src_rect.y(),
-                           src_rect.width(), src_rect.height())
-
-        # Draw annotations at logical coordinates (painter is already scaled)
-        painter.translate(-rect.x(), -rect.y())
+        blur_src = self._blur_source() if self._needs_blur_source() else None
         for action in self.actions:
-            draw_action(painter, action)
+            draw_action(painter, action, blur_source=blur_src)
         painter.end()
 
-        qimage = result.toImage()
-        buffer = qimage.bits().asstring(qimage.sizeInBytes())
-        return Image.frombytes("RGBA", (qimage.width(), qimage.height()), buffer, "raw", "BGRA")
+        qimage = result.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+        ptr = qimage.bits()
+        ptr.setsize(qimage.sizeInBytes())
+        raw = bytes(ptr)
+        # Drop any per-row padding Qt may add (bytesPerLine > width * 4)
+        stride = qimage.bytesPerLine()
+        if stride != qimage.width() * 4:
+            rows = [raw[i * stride:i * stride + qimage.width() * 4] for i in range(qimage.height())]
+            raw = b"".join(rows)
+        return Image.frombytes("RGBA", (qimage.width(), qimage.height()), raw, "raw", "RGBA")
 
     def _copy(self):
         try:
             result = self._get_result_image()
-            if IS_MACOS:
-                self._copy_macos(result)
-            else:
-                if result.mode != "RGBA": result = result.convert("RGBA")
-                data = result.tobytes("raw", "RGBA")
-                qimage = QImage(data, result.width, result.height, QImage.Format.Format_RGBA8888).copy()
-                QApplication.clipboard().setImage(qimage)
+            if result.mode != "RGBA":
+                result = result.convert("RGBA")
+            data = result.tobytes("raw", "RGBA")
+            qimage = QImage(data, result.width, result.height,
+                            QImage.Format.Format_RGBA8888).copy()
+            copy_image_to_clipboard(qimage)
+            QApplication.processEvents()
             self.image_copied.emit()
             self.close()
         except Exception as e:
             print(f"Copy error: {e}")
             self.close()
 
-    def _copy_macos(self, pil_image):
-        """Use native macOS NSPasteboard for universal clipboard compatibility"""
-        import io
-        import AppKit
-        import Foundation
-
-        # Convert to PNG bytes
-        buf = io.BytesIO()
-        pil_image.save(buf, format="PNG")
-        png_data = Foundation.NSData.dataWithBytes_length_(buf.getvalue(), len(buf.getvalue()))
-
-        # Write to macOS pasteboard with proper types
-        pb = AppKit.NSPasteboard.generalPasteboard()
-        pb.clearContents()
-        pb.setData_forType_(png_data, AppKit.NSPasteboardTypePNG)
-
     def _save(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Screenshot", "", "PNG (*.png);;JPG (*.jpg)")
-        if file_path:
-            result = self._get_result_image()
-            if not file_path.lower().endswith(('.png', '.jpg')): file_path += '.png'
-            if file_path.lower().endswith('.jpg'): result = result.convert('RGB')
-            result.save(file_path)
-            self.image_saved.emit(file_path)
-            self.close()
+        last_dir = app_config.get("last_save_dir", "") or ""
+        if not last_dir or not os.path.isdir(last_dir):
+            last_dir = screenshots_dir()
+        default_name = datetime.now().strftime("Screenshot_%Y-%m-%d_%H%M%S.png")
+        self._set_overlay_level(0)
+        try:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Screenshot", os.path.join(last_dir, default_name),
+                "PNG image (*.png);;JPEG image (*.jpg)")
+        finally:
+            self._set_overlay_level(25)
+        if not file_path:
+            self.activateWindow()
+            self.setFocus()
+            return
+        result = self._get_result_image()
+        if not file_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+            file_path += '.png'
+        if file_path.lower().endswith(('.jpg', '.jpeg')):
+            result = result.convert('RGB')
+        result.save(file_path)
+        app_config.set_value("last_save_dir", os.path.dirname(file_path))
+        self.image_saved.emit(file_path)
+        self.close()
 
     def _record(self):
         if self.selection_rect:
@@ -1109,81 +1148,79 @@ class OverlayWindow(QWidget):
         self.selection_cancelled.emit()
         self.close()
 
+    # ----------------------------------------------------------- keyboard
+
     def keyPressEvent(self, event):
-        # Handle inline text editing
+        key = event.key()
+        mods = event.modifiers()
+
         if self.text_editing:
-            key = event.key()
-            
             if key == Qt.Key.Key_Escape:
-                # Cancel text editing without saving
                 self.text_editing = False
                 self.text_position = None
                 self.text_content = ""
                 self.editing_action_index = None
                 self.update()
-                return
-                
             elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                # Finish editing and save text
                 self._finish_text_editing()
-                return
-                
             elif key == Qt.Key.Key_Backspace:
-                # Delete last character
                 if self.text_content:
                     self.text_content = self.text_content[:-1]
                     self.update()
-                return
-                
             elif key == Qt.Key.Key_Delete:
-                # Clear all text
                 self.text_content = ""
                 self.update()
-                return
-            
-            # Handle Ctrl+V paste
-            elif event.modifiers() & MODIFIER_KEY and key == Qt.Key.Key_V:
-                clipboard = QApplication.clipboard()
-                paste_text = clipboard.text()
+            elif mods & MODIFIER_KEY and key == Qt.Key.Key_V:
+                paste_text = QApplication.clipboard().text()
                 if paste_text:
-                    self.text_content += paste_text
+                    self.text_content += paste_text.replace("\n", " ")
                     self.update()
-                return
-            
-            # Handle Ctrl+C: finish text and copy screenshot
-            elif event.modifiers() & MODIFIER_KEY and key == Qt.Key.Key_C:
+            elif mods & MODIFIER_KEY and key == Qt.Key.Key_C:
                 self._finish_text_editing()
                 self._copy()
-                return
-            
-            # Handle Ctrl+S: finish text and save screenshot
-            elif event.modifiers() & MODIFIER_KEY and key == Qt.Key.Key_S:
+            elif mods & MODIFIER_KEY and key == Qt.Key.Key_S:
                 self._finish_text_editing()
                 self._save()
-                return
-                
             else:
-                # Add typed character (including space)
                 text = event.text()
                 if text and (text.isprintable() or text == ' '):
                     self.text_content += text
                     self.update()
-                return
-        
-        # Normal keyboard shortcuts when not editing text
-        if event.key() == Qt.Key.Key_Escape:
-            self._cancel()
-        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._copy()
-        elif event.modifiers() & MODIFIER_KEY:
-            if event.key() == Qt.Key.Key_C:
-                self._copy()
-            elif event.key() == Qt.Key.Key_S:
-                self._save()
-            elif event.key() == Qt.Key.Key_Z:
-                self._undo()
+            return
 
-def show_overlay(screenshot: Image.Image, offset_x: int = 0, offset_y: int = 0) -> OverlayWindow:
-    overlay = OverlayWindow(screenshot, offset_x, offset_y)
-    overlay.showFullScreen()
+        if key == Qt.Key.Key_Escape:
+            self._cancel()
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.selection_rect:
+                self._copy()
+        elif mods & MODIFIER_KEY:
+            if key == Qt.Key.Key_C:
+                if self.selection_rect:
+                    self._copy()
+            elif key == Qt.Key.Key_S:
+                if self.selection_rect:
+                    self._save()
+            elif key == Qt.Key.Key_Z and (mods & Qt.KeyboardModifier.ShiftModifier):
+                self._redo()
+            elif key == Qt.Key.Key_Z:
+                self._undo()
+            elif key == Qt.Key.Key_Y:
+                self._redo()
+            elif key == Qt.Key.Key_A and self.selection_complete is False:
+                # Select the whole screen
+                self.selection_rect = QRect(0, 0, self.width(), self.height())
+                self.selection_complete = True
+                if self.tool_toolbar is None:
+                    self._create_toolbars()
+                else:
+                    self._position_toolbars()
+                self.update()
+        elif key == Qt.Key.Key_Delete and self.selection_complete:
+            self._undo()
+
+
+def show_overlay(screenshot: Image.Image, offset_x: int = 0, offset_y: int = 0,
+                 capture_dpr: float = 1.0) -> OverlayWindow:
+    overlay = OverlayWindow(screenshot, offset_x, offset_y, capture_dpr)
+    overlay.show()
     return overlay

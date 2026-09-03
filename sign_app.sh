@@ -30,7 +30,7 @@ echo "Signing $APP_PATH with identity '$CERT' (inside-out, no --deep)..."
 find "$APP_PATH" -type f -print0 | xargs -0 codesign --remove-signature 2>/dev/null || true
 
 # 2. Sign EVERY nested Mach-O binary (extensions, dylibs, and standalone
-#    executables like ffmpeg / sc_audio_helper / embedded python) — but NOT
+#    executables like ffmpeg / sc_audio_helper / embedded python) - but NOT
 #    the bundle's own main executable (that gets signed by signing the .app).
 warns=0
 while IFS= read -r -d '' f; do

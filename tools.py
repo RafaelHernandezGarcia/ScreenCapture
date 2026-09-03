@@ -1,7 +1,6 @@
 """
 Drawing Tools - Tool implementations for annotations
 """
-import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -9,7 +8,7 @@ from PyQt6.QtCore import Qt, QPoint, QRect, QPointF
 from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QPolygonF
 import math
 
-SYSTEM_FONT = ".AppleSystemUIFont" if sys.platform == "darwin" else "Segoe UI"
+from platform_utils import SYSTEM_FONT
 
 
 @dataclass
@@ -166,6 +165,47 @@ class CircleTool(BaseTool):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             rect = QRect(self.start_point, self.current_point).normalized()
             painter.drawEllipse(rect)
+
+
+class BlurTool(BaseTool):
+    """Pixelate a rectangle (hide names, numbers, emails before sharing).
+
+    The tool only records the rectangle; rendering needs the underlying
+    screenshot, which the overlay passes to draw_action() as `blur_source`
+    (a pre-pixelated copy of the screenshot).
+    """
+
+    def get_name(self) -> str:
+        return "Blur"
+
+    def on_mouse_press(self, point: QPoint):
+        self.start_point = point
+        self.current_point = point
+        self.is_drawing = True
+
+    def on_mouse_move(self, point: QPoint):
+        if self.is_drawing:
+            self.current_point = point
+
+    def on_mouse_release(self, point: QPoint) -> Optional[DrawingAction]:
+        if self.start_point and self.is_drawing:
+            self.is_drawing = False
+            rect = QRect(self.start_point, point).normalized()
+            self.start_point = None
+            self.current_point = None
+            if rect.width() < 3 or rect.height() < 3:
+                return None
+            return DrawingAction(tool_type="blur", color=QColor(self.color), rect=rect)
+        return None
+
+    def draw_preview(self, painter: QPainter):
+        if self.start_point and self.current_point and self.is_drawing:
+            rect = QRect(self.start_point, self.current_point).normalized()
+            painter.save()
+            painter.setPen(QPen(QColor(255, 255, 255, 220), 1, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(0, 0, 0, 60))
+            painter.drawRect(rect)
+            painter.restore()
 
 
 class LineTool(BaseTool):
@@ -359,11 +399,29 @@ def draw_arrow(painter: QPainter, start: QPoint, end: QPoint, color: QColor, lin
         painter.restore() # RESTORE STATE (Crucial fix for the fill bug)
 
 
-def draw_action(painter: QPainter, action: DrawingAction):
-    """Draw a saved action"""
+def draw_action(painter: QPainter, action: DrawingAction, blur_source=None):
+    """Draw a saved action.
+
+    blur_source: optional QPixmap - a pixelated copy of the whole screenshot,
+    in the same coordinate space the painter is drawing the screenshot in.
+    Blur actions clip to their rect and paint that copy through the hole.
+    """
     line_width = getattr(action, 'line_width', 3)
-    
-    if action.tool_type == "arrow":
+
+    if action.tool_type == "blur":
+        if action.rect and blur_source is not None:
+            painter.save()
+            painter.setClipRect(action.rect)
+            painter.drawPixmap(0, 0, blur_source)
+            painter.restore()
+        elif action.rect:
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(120, 120, 120, 230))
+            painter.drawRect(action.rect)
+            painter.restore()
+
+    elif action.tool_type == "arrow":
         if len(action.points) >= 2:
             draw_arrow(painter, action.points[0], action.points[1], action.color, line_width)
     

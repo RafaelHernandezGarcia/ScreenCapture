@@ -14,46 +14,84 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QWidget
 
-IS_MACOS = sys.platform == "darwin"
-IS_WINDOWS = sys.platform == "win32"
+from platform_utils import IS_MACOS, IS_WINDOWS, make_non_activating
 
 DEFAULT_RADIUS = 80  # pixels (logical)
 
+_CAMERA_CACHE = None  # (index, name) list; enumeration is slow, do it once
 
-def list_cameras(max_check=5):
+
+def _list_cameras_windows():
+    """Windows: real device names via DirectShow (pygrabber), in DirectShow
+    index order - the same order cv2.VideoCapture(idx, CAP_DSHOW) uses.
+
+    Runs on its own thread with its own COM apartment: pygrabber needs an
+    STA, and the audio stack (soundcard) may already have put the calling
+    thread in a different mode ("Cannot change thread mode after it is set").
+    """
+    result = {}
+
+    def _enum():
+        try:
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+            from pygrabber.dshow_graph import FilterGraph
+            names = FilterGraph().get_input_devices()
+            result["cams"] = [(i, str(n)) for i, n in enumerate(names)]
+        except Exception as e:
+            result["err"] = e
+
+    t = threading.Thread(target=_enum, daemon=True, name="sc-cam-enum")
+    t.start()
+    t.join(timeout=8)
+    return result.get("cams", [])
+
+
+def list_cameras(max_check=5, refresh=False):
     """Detect available cameras as (index, name) tuples.
 
     On macOS we enumerate via AVFoundation, which lists devices WITHOUT
     Camera permission and without opening them. Probing with OpenCV (the
     old approach) silently fails when Camera permission hasn't been granted
-    yet — so it reported "no cameras" even though cameras exist. The actual
+    yet - so it reported "no cameras" even though cameras exist. The actual
     permission prompt happens later, when the webcam is turned on.
 
-    On other platforms we probe with OpenCV.
+    On Windows we ask DirectShow for the device names (fast, no camera is
+    opened). Elsewhere, or as a fallback, we probe with OpenCV.
     """
+    global _CAMERA_CACHE
+    if _CAMERA_CACHE is not None and not refresh:
+        return list(_CAMERA_CACHE)
+
+    cams = []
     if IS_MACOS:
         try:
             from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
             devices = AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo)
             cams = [(i, str(dev.localizedName())) for i, dev in enumerate(devices)]
-            if cams:
-                return cams
         except Exception:
-            pass
-        # fall through to OpenCV probing if AVFoundation found nothing
+            cams = []
+    elif IS_WINDOWS:
+        cams = _list_cameras_windows()
 
-    import cv2
-    cameras = []
-    for idx in range(max_check):
-        cap = cv2.VideoCapture(idx)
-        if cap.isOpened():
-            ret, _ = cap.read()
-            cap.release()
-            if ret:
-                cameras.append((idx, f"Camera {idx}"))
-        else:
-            cap.release()
-    return cameras
+    if not cams:
+        import cv2
+        backend = cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_ANY
+        for idx in range(max_check):
+            cap = cv2.VideoCapture(idx, backend)
+            if cap.isOpened():
+                ret, _ = cap.read()
+                cap.release()
+                if ret:
+                    cams.append((idx, f"Camera {idx}"))
+            else:
+                cap.release()
+
+    _CAMERA_CACHE = list(cams)
+    return cams
 
 
 class WebcamCapture(QThread):
@@ -65,7 +103,7 @@ class WebcamCapture(QThread):
     frame_ready = pyqtSignal()
 
     # Capture mode we ASK the camera for. Without this, OpenCV opens the
-    # camera in its default mode — usually the highest native resolution —
+    # camera in its default mode - usually the highest native resolution -
     # which delivers full-res uncompressed frames at a sluggish rate and
     # makes motion look laggy (the better the camera, the worse it gets).
     # 720p30 is exactly what Google Meet / WhatsApp request: smooth, light,
@@ -99,7 +137,17 @@ class WebcamCapture(QThread):
         we always read the FRESHEST frame at a steady rate, instead of
         draining a deep buffer of stale full-res frames.
         """
-        cap = cv2.VideoCapture(index)
+        cap = None
+        if IS_WINDOWS:
+            # DirectShow opens in a few seconds and honours the 720p30 /
+            # buffer-size requests below; the default MSMF backend is often
+            # much slower to open and ignores CAP_PROP_BUFFERSIZE.
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = None
+        if cap is None:
+            cap = cv2.VideoCapture(index)
         if not cap.isOpened():
             cap.release()
             return None
@@ -137,7 +185,7 @@ class WebcamCapture(QThread):
         try:
             while not self._stop_event.is_set():
                 # read() blocks until the next sensor frame, so it paces the
-                # loop to the camera's real frame rate (≈30fps) on its own —
+                # loop to the camera's real frame rate (~30fps) on its own -
                 # no artificial sleep needed, which only added latency.
                 ret, frame = cap.read()
                 if ret and frame is not None:
@@ -180,6 +228,7 @@ class WebcamPreviewWidget(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        make_non_activating(self)  # dragging the circle must not steal focus
         self.setFixedSize(diameter + 6, diameter + 6)  # +6 for border
 
         # Start tucked into the bottom-right corner, hugging the recording
@@ -195,7 +244,7 @@ class WebcamPreviewWidget(QWidget):
         cx, cy = self._clamp_pos(x, y)
         # A move() issued before the native window is realized drifts upward
         # ~20px on macOS (Qt reports it lower than requested), which made the
-        # circle sit too high — tight on the right but loose on the bottom. We
+        # circle sit too high - tight on the right but loose on the bottom. We
         # stash the target and re-assert it in _apply_nswindow once the window
         # exists, where the position sticks exactly.
         self._target_pos = (int(cx), int(cy))
@@ -208,6 +257,7 @@ class WebcamPreviewWidget(QWidget):
         # A slow fallback timer keeps it alive if the camera stalls.
         if self._webcam is not None:
             self._webcam.frame_ready.connect(self.update)
+        self._opening = True  # show a "Starting camera" hint until frames arrive
         self._refresh = QTimer(self)
         self._refresh.timeout.connect(self.update)
         self._refresh.start(200)  # fallback only; frames drive the repaint
@@ -290,6 +340,16 @@ class WebcamPreviewWidget(QWidget):
             p.setClipPath(path)
             p.drawPixmap(3, 3, pixmap)
             p.setClipping(False)
+            self._opening = False
+        elif self._opening:
+            # Camera still warming up (DirectShow takes a few seconds):
+            # say so instead of showing a black hole.
+            from PyQt6.QtGui import QFont
+            from platform_utils import SYSTEM_FONT
+            p.setPen(QColor(255, 255, 255, 210))
+            p.setFont(QFont(SYSTEM_FONT, 10))
+            p.drawText(QRect(3, 3, radius * 2, radius * 2),
+                       Qt.AlignmentFlag.AlignCenter, "Starting\ncamera...")
 
         # Redraw border on top
         p.setPen(QPen(QColor(255, 255, 255, 200), 3))

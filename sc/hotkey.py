@@ -1,11 +1,11 @@
 """Process-global hotkeys via Carbon RegisterEventHotKey.
 
 Why Carbon and not pynput / NSEvent global monitor:
-- pynput → CGEventTap → requires Accessibility permission, which TCC
+- pynput -> CGEventTap -> requires Accessibility permission, which TCC
   invalidates on every app rebuild (cdhash changes).
-- NSEvent.addGlobalMonitor → also requires Accessibility for
+- NSEvent.addGlobalMonitor -> also requires Accessibility for
   non-modifier keys (F13 etc).
-- RegisterEventHotKey → process-scoped registration with the WindowServer.
+- RegisterEventHotKey -> process-scoped registration with the WindowServer.
   Zero permission needed. Survives rebuilds. Works on every Space.
   This is what Shottr / CleanShot X / iTerm2 / Spectacle all use.
 
@@ -25,7 +25,7 @@ _carbon = ctypes.CDLL("/System/Library/Frameworks/Carbon.framework/Carbon")
 
 
 def _fourcc(s: str) -> int:
-    """4-char string → big-endian uint32 (OSType)."""
+    """4-char string -> big-endian uint32 (OSType)."""
     s = (s + "    ")[:4]
     return int.from_bytes(s.encode("ascii"), "big")
 
@@ -53,7 +53,7 @@ class _EventTypeSpec(Structure):
 
 _HandlerProc = CFUNCTYPE(c_int32, c_void_p, c_void_p, c_void_p)
 
-# Function prototypes — must be set before any call so ctypes does the
+# Function prototypes - must be set before any call so ctypes does the
 # right thing with pointer/integer widths on arm64.
 _carbon.GetApplicationEventTarget.restype = c_void_p
 _carbon.GetApplicationEventTarget.argtypes = []
@@ -86,7 +86,7 @@ _carbon.GetEventParameter.argtypes = [
 class HotkeyManager:
     """Manage one or more process-global hotkeys.
 
-    The handler must be retained for the lifetime of the app — Carbon
+    The handler must be retained for the lifetime of the app - Carbon
     keeps the function pointer but the Python proxy will be garbage
     collected if you don't.
     """

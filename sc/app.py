@@ -1,4 +1,4 @@
-"""Native app controller — wires tray + hotkey + capture + overlay.
+"""Native app controller - wires tray + hotkey + capture + overlay.
 
 This is the single entry point for the macOS build. It is pure PyObjC:
 no Qt, no Spaces dance, no DPI gymnastics. The flow is
@@ -11,7 +11,7 @@ no Qt, no Spaces dance, no DPI gymnastics. The flow is
 
 The capture happens on the SAME runloop tick as the trigger and BEFORE
 any window of ours appears, so macOS never switches Spaces and never
-reveals the desktop wallpaper — the bug that plagued the Qt build.
+reveals the desktop wallpaper - the bug that plagued the Qt build.
 """
 import socket
 import sys
@@ -55,7 +55,7 @@ class AppController:
             (f"Capture Screen   ({label})", self.capture),
             ("-", None),
             ("Open Screenshots Folder", self.open_screenshots_folder),
-            ("Screen Recording Permission…",
+            ("Screen Recording Permission...",
              lambda: permissions.open_settings("ScreenRecording")),
             ("-", None),
             ("About ScreenCapture", self.about),
@@ -103,8 +103,8 @@ class AppController:
         alert.setInformativeText_(
             "A fast, native screenshot tool.\n\n"
             f"Press {self.cfg.get('hotkey_label', 'F13')} anywhere to capture "
-            "the screen under your cursor, drag to select, then ⌘C to copy "
-            "or ⌘S to save."
+            "the screen under your cursor, drag to select, then CmdC to copy "
+            "or CmdS to save."
         )
         icon = _app_icon()
         if icon is not None:
@@ -131,7 +131,7 @@ class AppController:
             "macOS requires Screen Recording permission to capture other "
             "apps' windows. Without it, screenshots show only the desktop "
             "wallpaper.\n\n"
-            "Enable ScreenCapture under Privacy & Security → Screen "
+            "Enable ScreenCapture under Privacy & Security -> Screen "
             "Recording, then quit and reopen the app."
         )
         alert.addButtonWithTitle_("Open Settings")
@@ -160,7 +160,7 @@ def main():
     global _lock_socket, _controller
 
     # Single-instance guard: bind a localhost port. If it's taken, another
-    # instance already owns the menu bar — just exit quietly.
+    # instance already owns the menu bar - just exit quietly.
     _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         _lock_socket.bind(("127.0.0.1", _LOCK_PORT))

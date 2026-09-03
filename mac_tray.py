@@ -1,7 +1,7 @@
 """Native macOS menu-bar status item (NSStatusItem) for the Qt app.
 
 Why this exists: PyQt6's QSystemTrayIcon fails to *render* for an
-LSUIElement (menu-bar-only) app launched via LaunchServices — it reports
+LSUIElement (menu-bar-only) app launched via LaunchServices - it reports
 isSystemTrayAvailable()=True and isVisible()=True, but no icon appears on
 the menu bar. NSStatusItem always renders. Qt's event loop on macOS is
 the Cocoa run loop, so an NSStatusItem coexists with QApplication and its
@@ -37,7 +37,7 @@ class _MenuTarget(NSObject):
                 import traceback
                 traceback.print_exc()
 
-    # NSMenuDelegate — called right before a submenu is displayed.
+    # NSMenuDelegate - called right before a submenu is displayed.
     def menuNeedsUpdate_(self, menu):
         builder = self._submenu_builders.get(id(menu))
         if builder:

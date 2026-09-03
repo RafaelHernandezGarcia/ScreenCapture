@@ -1,4 +1,4 @@
-"""Menu-bar tray (NSStatusItem) — pure PyObjC.
+"""Menu-bar tray (NSStatusItem) - pure PyObjC.
 
 Holds module-level references to the status item and menu target so
 nothing gets garbage-collected. Without those, the icon disappears
@@ -73,9 +73,9 @@ def install(items):
             img.setSize_((18, 18))
             btn.setImage_(img)
         else:
-            btn.setTitle_("📷")
+            btn.setTitle_("SC")
     else:
-        btn.setTitle_("📷")
+        btn.setTitle_("SC")
 
     target = _Target.alloc().init()
     menu = NSMenu.alloc().init()

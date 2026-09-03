@@ -4,8 +4,7 @@ Recording Toolbar - ScreenPal-style floating control bar during recording.
 Replaces the simple StopRecordingButton with a full toolbar containing:
 pause/resume, stop, timer, mic mute, webcam toggle, draw toggle.
 """
-import sys
-from PyQt6.QtCore import Qt, QRect, QSize, QTimer, pyqtSignal, QSettings
+from PyQt6.QtCore import Qt, QRect, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QColor, QFont, QPen, QIcon, QPixmap, QPainterPath, QLinearGradient
 )
@@ -15,16 +14,15 @@ from PyQt6.QtWidgets import (
     QCheckBox, QPushButton, QApplication
 )
 
+from platform_utils import IS_MACOS, IS_WINDOWS, SYSTEM_FONT, make_non_activating
+import app_config
+
 # Quick-pick palette (shared with overlay)
 _PALETTE_COLORS = [
     "#000000", "#ffffff", "#e63946", "#2a9d8f", "#e9c46a", "#264653",
     "#f4a261", "#2ec4b6", "#ff6b6b", "#4ecdc4", "#45b7d1", "#96ceb4",
     "#ffeaa7", "#dfe6e9", "#a29bfe", "#fd79a8", "#636e72", "#b2bec3",
 ]
-
-IS_MACOS = sys.platform == "darwin"
-IS_WINDOWS = sys.platform == "win32"
-SYSTEM_FONT = ".AppleSystemUIFont" if IS_MACOS else "Segoe UI"
 
 # --- Icon factory for toolbar buttons ---
 
@@ -176,6 +174,27 @@ class ToolbarButton(QToolButton):
         """)
 
 
+class _RecDot(QWidget):
+    """The pulsing red "recording" dot (painted, so no Unicode glyph needed)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(16, 16)
+        self._color = QColor("#FF453A")
+
+    def set_color(self, hex_color: str):
+        self._color = QColor(hex_color)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._color)
+        p.drawEllipse(3, 3, 10, 10)
+        p.end()
+
+
 class StopButton(QToolButton):
     """Primary 'Stop' action: a raised red pill with unmistakable hover and a
     real tactile press.
@@ -183,7 +202,7 @@ class StopButton(QToolButton):
     Painted by hand (not stylesheet) so it actually reads as pressable:
     glossy top sheen + top-light/bottom-dark gradient at rest (a raised
     button), a clearly brighter fill plus a white ring on hover (strong
-    contrast), and on press it visibly SINKS — flat darker fill, no sheen,
+    contrast), and on press it visibly SINKS - flat darker fill, no sheen,
     nudged down, square shrunk.
     """
 
@@ -291,6 +310,7 @@ class RecordingToolbar(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        make_non_activating(self)  # Windows: never steal focus from the recorded app
 
         self._build_ui()
 
@@ -335,7 +355,7 @@ class RecordingToolbar(QWidget):
         self._pause_btn.clicked.connect(self._on_pause)
         layout.addWidget(self._pause_btn)
 
-        # Stop button — custom raised red pill (see StopButton) so it clearly
+        # Stop button - custom raised red pill (see StopButton) so it clearly
         # reads as pressable at rest, jumps on hover, and sinks when clicked.
         self._stop_btn = StopButton(self)
         self._stop_btn.clicked.connect(self.stop_clicked.emit)
@@ -350,10 +370,7 @@ class RecordingToolbar(QWidget):
         layout.addSpacing(4)
 
         # Live red REC dot (pulses)
-        self._rec_dot = QLabel("●", self)
-        self._rec_dot.setStyleSheet("color:#FF453A; font-size:13px; background:transparent;")
-        self._rec_dot.setFixedWidth(16)
-        self._rec_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._rec_dot = _RecDot(self)
         layout.addWidget(self._rec_dot)
 
         # Timer label
@@ -420,14 +437,13 @@ class RecordingToolbar(QWidget):
         self._elapsed += 1
         m, s = divmod(self._elapsed, 60)
         self._timer_label.setText(f"{m}:{s:02d}")
-        # Pulse the REC dot (dim/bright each second) — unless paused.
+        # Pulse the REC dot (dim/bright each second) - unless paused.
         if hasattr(self, "_rec_dot"):
             if self._is_paused:
-                self._rec_dot.setStyleSheet("color:#8E8E93; font-size:13px; background:transparent;")
+                self._rec_dot.set_color("#8E8E93")
             else:
                 on = (self._elapsed % 2 == 0)
-                shade = "#FF453A" if on else "#7A1F1B"
-                self._rec_dot.setStyleSheet(f"color:{shade}; font-size:13px; background:transparent;")
+                self._rec_dot.set_color("#FF453A" if on else "#7A1F1B")
 
     def _on_pause(self):
         if self._is_paused:
@@ -502,14 +518,12 @@ class RecordingToolbar(QWidget):
         self._drag_pos = None
 
 
-# --- Default annotation color persistence ---
-_DEFAULT_COLOR_KEY = "annotation_default_color"
-
+# --- Default annotation color persistence (shared with the screenshot overlay
+#     through config.json, so one preference drives both) ---
 
 def _load_default_color():
-    """Load saved default color from settings, or None."""
-    s = QSettings("ScreenCapture", "ScreenCapture")
-    hex_val = s.value(_DEFAULT_COLOR_KEY, None)
+    """Load the saved default annotation color, or None."""
+    hex_val = app_config.get("default_color", None)
     if hex_val and isinstance(hex_val, str):
         c = QColor(hex_val)
         if c.isValid():
@@ -519,9 +533,7 @@ def _load_default_color():
 
 def _save_default_color(color: QColor):
     """Save color as default for next session."""
-    s = QSettings("ScreenCapture", "ScreenCapture")
-    s.setValue(_DEFAULT_COLOR_KEY, color.name())
-    s.sync()
+    app_config.set_value("default_color", color.name().upper())
 
 
 class ColorPickerPopup(QDialog):
@@ -550,8 +562,8 @@ class ColorPickerPopup(QDialog):
         layout.setSpacing(10)
         layout.setContentsMargins(12, 12, 12, 12)
 
-        # Open native macOS Colors (round wheel, sliders, palettes tabs)
-        open_btn = QPushButton("Open color picker…", self)
+        # Open the native color dialog (macOS Colors panel / Windows picker)
+        open_btn = QPushButton("Open color picker...", self)
         open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         open_btn.setStyleSheet("""
             QPushButton {
@@ -687,15 +699,6 @@ class ColorPickerPopup(QDialog):
             self._current_color = c
             self._update_swatch()
 
-    def _apply_hex(self):
-        text = self._hex_edit.text().strip()
-        if not text.startswith("#"):
-            text = "#" + text
-        c = QColor(text)
-        if c.isValid():
-            self._current_color = c
-            self._color_dialog.setCurrentColor(c)
-
     def _copy_hex(self):
         text = self._current_color.name()
         cb = QApplication.clipboard()
@@ -728,6 +731,8 @@ class DrawingSubPanel(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        make_non_activating(self)
 
         self._build_ui()
 
@@ -810,7 +815,8 @@ class DrawingSubPanel(QWidget):
         btn_global = self._color_btn.mapToGlobal(self._color_btn.rect().bottomLeft())
         x = btn_global.x() - popup.width() // 2 + self._color_btn.width() // 2
         y = btn_global.y() + 4
-        screen = QApplication.primaryScreen().availableGeometry()
+        scr = QApplication.screenAt(btn_global) or QApplication.primaryScreen()
+        screen = scr.availableGeometry()
         x = max(screen.x(), min(x, screen.right() - popup.width()))
         y = max(screen.y(), min(y, screen.bottom() - popup.height()))
         popup.move(x, y)

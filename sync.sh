@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sync development source → macOS app bundle (run after making changes)
+# Sync development source -> macOS app bundle (run after making changes)
 SRC="${1:-$HOME/Documents/ScreenCapture}"
 
 # Prefer ~/Applications (install.sh default) then /Applications
@@ -16,7 +16,7 @@ else
   exit 1
 fi
 
-echo "Syncing $SRC → $APP ..."
+echo "Syncing $SRC -> $APP ..."
 osascript -e 'quit app "ScreenCapture"' 2>/dev/null
 sleep 2
 pkill -f "ScreenCapture.app" 2>/dev/null

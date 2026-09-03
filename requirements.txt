@@ -1,14 +1,27 @@
+# ScreenCapture dependencies. Install into the project venv:
+#     python -m venv .venv
+#     .venv\Scripts\pip install -r requirements.txt        (Windows)
+#     .venv/bin/pip install -r requirements.txt            (macOS)
+#
+# Core (all platforms)
 PyQt6>=6.6.0
 mss>=9.0.0
 Pillow>=10.0.0
-pynput>=1.7.6; sys_platform == "darwin"
-pywin32>=306; sys_platform == "win32"
-imageio>=2.31.0
-imageio-ffmpeg>=0.4.9
 numpy>=1.24.0
-av>=12.0.0
-sounddevice>=0.4.6
-opencv-python-headless>=4.8.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9          # bundles the ffmpeg binary used to mux MP4 + AAC
+av>=12.0.0                     # PyAV: H.264 encoding
+sounddevice>=0.4.6             # microphone (PortAudio) + silent keep-alive stream
+opencv-python-headless>=4.8.0  # webcam capture + frame scaling (headless: no GUI libs)
+
+# Windows only
+pywin32>=306; sys_platform == "win32"        # Startup shortcut, COM init
+SoundCard>=0.4.3; sys_platform == "win32"    # WASAPI loopback = record what the computer plays
+comtypes>=1.2; sys_platform == "win32"       # required by pygrabber
+pygrabber>=0.2; sys_platform == "win32"      # real webcam names via DirectShow
+
+# macOS only
+pynput>=1.7.6; sys_platform == "darwin"
 pyobjc-framework-ScreenCaptureKit>=10.0; sys_platform == "darwin"
 pyobjc-framework-CoreMedia>=10.0; sys_platform == "darwin"
 # AVFoundation is required for camera/mic permission + camera enumeration.

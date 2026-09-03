@@ -1,10 +1,10 @@
-"""Selection overlay — pure PyObjC NSPanel + NSView.
+"""Selection overlay - pure PyObjC NSPanel + NSView.
 
 Why NSPanel and not NSWindow:
 - NSPanel supports the NSWindowStyleMaskNonactivatingPanel style mask.
 - A non-activating panel can become the key window WITHOUT activating
   the owning app. macOS therefore never switches Spaces to the app's
-  "home" Space — the panel just appears on the user's current Space.
+  "home" Space - the panel just appears on the user's current Space.
 - Combined with NSWindowCollectionBehaviorCanJoinAllSpaces +
   Stationary + Transient, the panel is invisible to Mission Control,
   Cmd+Tab, and the Dock.
@@ -78,7 +78,7 @@ def show(pil_image, screen_frame: dict, on_close=None):
     panel.setContentView_(view)
     panel.makeKeyAndOrderFront_(None)
     # The screenshot was already grabbed before this panel appeared, so
-    # activating the app here is safe — it can't change what we captured,
+    # activating the app here is safe - it can't change what we captured,
     # and the panel is already CanJoinAllSpaces so macOS won't switch
     # Spaces. Activation is what makes the key window actually receive
     # keyDown: (Esc / Cmd+C / Cmd+S). Without it a background app's panel
@@ -96,7 +96,7 @@ class _OverlayPanel(NSPanel):
     """Borderless panel that CAN become key.
 
     A plain borderless NSWindow/NSPanel returns NO from canBecomeKeyWindow,
-    so it never receives keyDown: — that was the bug that trapped the user
+    so it never receives keyDown: - that was the bug that trapped the user
     (Esc did nothing). Overriding these two selectors fixes it.
     """
 
@@ -161,7 +161,7 @@ class _SelectionView(NSView):
     """Custom NSView that:
        - paints the captured screenshot under a dim veil
        - punches the selection rectangle through to the live screen
-         (well — to the dimmed-but-otherwise-untouched screenshot)
+         (well - to the dimmed-but-otherwise-untouched screenshot)
        - tracks mouseDown/Dragged/Up to set the selection
        - handles Cmd+C / Cmd+S / Esc / Return
     """
@@ -231,13 +231,13 @@ class _SelectionView(NSView):
             # Pre-selection hint
             self._draw_hint(bounds)
 
-        # On-screen action buttons (always at least Cancel) — the mouse
+        # On-screen action buttons (always at least Cancel) - the mouse
         # fallback so the user can always escape, even if keyboard focus
         # somehow fails.
         self._draw_buttons()
 
     def _draw_dimensions(self, sel):
-        text = f"{int(sel.size.width)} × {int(sel.size.height)}"
+        text = f"{int(sel.size.width)} x {int(sel.size.height)}"
         attrs = {
             NSFontAttributeName: NSFont.systemFontOfSize_(_HINT_FONT_SIZE),
             NSForegroundColorAttributeName: NSColor.whiteColor(),
@@ -277,7 +277,7 @@ class _SelectionView(NSView):
             ).stroke()
 
     def _draw_hint(self, bounds):
-        text = "Drag to select  ·  Esc to cancel  ·  ⌘C to copy  ·  ⌘S to save"
+        text = "Drag to select  |  Esc to cancel  |  CmdC to copy  |  CmdS to save"
         attrs = {
             NSFontAttributeName: NSFont.systemFontOfSize_(13),
             NSForegroundColorAttributeName:
@@ -311,7 +311,7 @@ class _SelectionView(NSView):
         cw = 96
         out.append((
             NSMakeRect(b.size.width - cw - margin, margin, cw, bh),
-            "cancel", "✕  Cancel",
+            "cancel", "x  Cancel",
         ))
         sel = self._sel
         if sel is not None and self._origin is None \
@@ -325,8 +325,8 @@ class _SelectionView(NSView):
             y = sel.origin.y + sel.size.height + 10
             if y + bh > b.size.height - 4:        # no room below -> inside
                 y = sel.origin.y + sel.size.height - bh - 10
-            out.append((NSMakeRect(x, y, bw, bh), "copy", "Copy  ⌘C"))
-            out.append((NSMakeRect(x + bw + gap, y, bw, bh), "save", "Save  ⌘S"))
+            out.append((NSMakeRect(x, y, bw, bh), "copy", "Copy  CmdC"))
+            out.append((NSMakeRect(x + bw + gap, y, bw, bh), "save", "Save  CmdS"))
         return out
 
     def _draw_buttons(self):
@@ -395,7 +395,7 @@ class _SelectionView(NSView):
         self.setNeedsDisplay_(True)
 
     def rightMouseDown_(self, event):
-        # Right-click anywhere cancels — last-resort escape hatch.
+        # Right-click anywhere cancels - last-resort escape hatch.
         self._cancel()
 
     def mouseDragged_(self, event):
@@ -504,7 +504,7 @@ class _SelectionView(NSView):
 # -------------------------------------------------------------------------
 
 def _pil_to_nsimage(pil) -> NSImage:
-    """Convert PIL.Image → NSImage via PNG bytes (lossless, ~1ms)."""
+    """Convert PIL.Image -> NSImage via PNG bytes (lossless, ~1ms)."""
     buf = io.BytesIO()
     pil.save(buf, format="PNG")
     data = NSData.dataWithBytes_length_(buf.getvalue(), len(buf.getvalue()))

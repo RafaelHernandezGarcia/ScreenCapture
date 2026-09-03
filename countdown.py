@@ -1,12 +1,11 @@
 """
 Countdown Overlay - Shows 3, 2, 1 before screen recording starts
 """
-import sys
 from PyQt6.QtCore import Qt, QTimer, QRect, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QFont
 from PyQt6.QtWidgets import QWidget
 
-SYSTEM_FONT = ".AppleSystemUIFont" if sys.platform == "darwin" else "Segoe UI"
+from platform_utils import SYSTEM_FONT, make_non_activating
 
 
 class CountdownOverlay(QWidget):
@@ -19,7 +18,7 @@ class CountdownOverlay(QWidget):
         self._count = 3
         self._screen_geo = screen_geo
         # The number is centered on the selected recording region (if given),
-        # not the whole screen — it should sit over what you're recording.
+        # not the whole screen - it should sit over what you're recording.
         self._region_rect = region_rect
 
         self.setWindowFlags(
@@ -31,6 +30,7 @@ class CountdownOverlay(QWidget):
         # Show without activating so macOS doesn't switch to the app's home
         # Space and reveal the desktop wallpaper behind the countdown.
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        make_non_activating(self)
         self.setGeometry(screen_geo)
 
         self._timer = QTimer(self)
@@ -91,4 +91,4 @@ class CountdownOverlay(QWidget):
         if event.key() == Qt.Key.Key_Escape:
             self._timer.stop()
             self.close()
-            # Don't emit countdown_finished — cancels recording
+            # Don't emit countdown_finished - cancels recording
