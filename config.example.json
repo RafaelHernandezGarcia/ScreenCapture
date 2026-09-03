@@ -3,6 +3,7 @@
   "camera_index": 0,
   "recording_size": "native",
   "webcam_default": false,
+  "webcam_radius": 110,
   "mic_default": true,
   "system_audio": true,
   "show_cursor": true,

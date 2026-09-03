@@ -16,7 +16,8 @@ from PyQt6.QtWidgets import QWidget
 
 from platform_utils import IS_MACOS, IS_WINDOWS, make_non_activating
 
-DEFAULT_RADIUS = 80  # pixels (logical)
+DEFAULT_RADIUS = 110  # pixels (logical); mouse wheel over the circle resizes it
+MIN_RADIUS, MAX_RADIUS = 50, 240
 
 _CAMERA_CACHE = None  # (index, name) list; enumeration is slow, do it once
 
@@ -216,8 +217,14 @@ class WebcamPreviewWidget(QWidget):
         self._webcam = webcam_capture
         self._recording_rect = recording_rect
         self._dpr = dpr
-        self._radius = DEFAULT_RADIUS
+        try:
+            import app_config
+            self._radius = int(app_config.get("webcam_radius", DEFAULT_RADIUS) or DEFAULT_RADIUS)
+        except Exception:
+            self._radius = DEFAULT_RADIUS
+        self._radius = max(MIN_RADIUS, min(MAX_RADIUS, self._radius))
         self._drag_pos = None
+        self._scaled_cache = None  # (frame id, QPixmap) so repaints do not re-resize
 
         diameter = self._radius * 2
 
@@ -317,27 +324,35 @@ class WebcamPreviewWidget(QWidget):
         p.setBrush(QColor(0, 0, 0, 180))
         p.drawEllipse(3, 3, radius * 2, radius * 2)
 
-        # Draw webcam frame
+        # Draw webcam frame at the screen's PHYSICAL resolution. The circle is
+        # recorded by being screen-captured, so every physical pixel we draw
+        # here is a pixel of face in the video; drawing at logical size on a
+        # 150 percent screen (or with a plain linear shrink) made it blurry.
         frame = self._webcam.get_latest_frame() if self._webcam else None
         if frame is not None:
             import cv2
-            # Resize and crop to square
             h, w = frame.shape[:2]
             side = min(h, w)
             y_off = (h - side) // 2
             x_off = (w - side) // 2
             square = frame[y_off:y_off+side, x_off:x_off+side]
-            resized = cv2.resize(square, (radius * 2, radius * 2))
+            screen_dpr = float(self.devicePixelRatioF() or 1.0)
+            target = max(2, int(round(radius * 2 * screen_dpr)))
+            interp = cv2.INTER_AREA if side > target else cv2.INTER_CUBIC
+            resized = cv2.resize(square, (target, target), interpolation=interp)
             rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            rgb = np.ascontiguousarray(rgb)
 
             qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
-                          rgb.strides[0], QImage.Format.Format_RGB888)
+                          rgb.strides[0], QImage.Format.Format_RGB888).copy()
             pixmap = QPixmap.fromImage(qimg)
+            pixmap.setDevicePixelRatio(screen_dpr)  # drawn at logical size, crisp
 
             # Clip to circle
             path = QPainterPath()
             path.addEllipse(3, 3, radius * 2, radius * 2)
             p.setClipPath(path)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             p.drawPixmap(3, 3, pixmap)
             p.setClipping(False)
             self._opening = False
@@ -387,3 +402,30 @@ class WebcamPreviewWidget(QWidget):
 
     def enterEvent(self, event):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def wheelEvent(self, event):
+        """Mouse wheel over the circle grows / shrinks it (remembered)."""
+        step = 8 if event.angleDelta().y() > 0 else -8
+        self.set_radius(self._radius + step)
+
+    def set_radius(self, radius: int):
+        radius = max(MIN_RADIUS, min(MAX_RADIUS, int(radius)))
+        if radius == self._radius:
+            return
+        # Keep the circle centred where it was while it changes size.
+        cx = self.x() + self.width() // 2
+        cy = self.y() + self.height() // 2
+        self._radius = radius
+        diameter = radius * 2
+        self.setFixedSize(diameter + 6, diameter + 6)
+        self._update_mask()
+        x, y = self._clamp_pos(cx - self.width() // 2, cy - self.height() // 2)
+        self.move(x, y)
+        self._target_pos = (x, y)
+        self._emit_position()
+        self.update()
+        try:
+            import app_config
+            app_config.set_value("webcam_radius", radius)
+        except Exception:
+            pass

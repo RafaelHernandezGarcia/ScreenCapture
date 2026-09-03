@@ -462,7 +462,10 @@ class ScreenRecorder(QThread):
             stream.width = out_w
             stream.height = out_h
             stream.pix_fmt = 'yuv420p'
-            stream.options = {'preset': 'ultrafast', 'crf': '23'}
+            # veryfast/crf 20 instead of ultrafast/23: noticeably sharper small
+            # detail (webcam face, UI text) for a modest CPU cost; the encoder
+            # runs on its own thread so capture pacing is unaffected.
+            stream.options = {'preset': 'veryfast', 'crf': '20'}
 
             # --- Encoder on its own thread so a slow encode never stalls frame
             #     capture (smoother video). The capture loop only grabs +

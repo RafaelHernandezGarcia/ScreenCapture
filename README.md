@@ -115,7 +115,8 @@ Keyboard inside the overlay:
 
 Recording: press Record in the overlay. A card lets you turn the webcam,
 microphone and computer audio on or off; drag the round camera picture
-anywhere inside the red area; press Start recording. After 3-2-1 the floating
+anywhere inside the red area and turn the mouse wheel over it to make it
+bigger or smaller (the size is remembered); press Start recording. After 3-2-1 the floating
 bar has pause, stop, timer, mic mute, webcam and a drawing mode. Drag the red
 grip above the border to move the recorded area. Stop reveals the MP4 in
 Videos\ScreenCapture (Movies/ScreenCapture on macOS).
@@ -204,6 +205,7 @@ app you are recording keeps keyboard focus.
 | "ScreenCapture is already running" | It is in the tray. Double-click the icon or press the hotkey. |
 | Tiny toolbars on the laptop screen | config.json has windows_dpi_scaling = false. Set it to true (default) and restart. |
 | Recording has no computer audio | Tray menu: Record Computer Audio must be on and the doctor must show "computer audio ok". Some USB docks expose a loopback only for the active output device: check Windows Sound settings. |
+| Webcam looks blurry in the video | The circle is recorded from the screen, so its size on screen is its size in the video. Make it bigger (mouse wheel over it) and record a larger area, or 1080p output from a small area upscales everything. |
 | Webcam takes 3-4 seconds to appear | Normal for DirectShow on Windows; the circle shows "Starting camera" meanwhile. Turn the webcam on in the setup card, not mid-recording. |
 | "No cameras detected" | Another app (Teams) holds the camera, or the Camera privacy toggle is off. Webcam > Refresh list after fixing. |
 | Video plays but audio cuts | Do not shrink the mic buffer or re-add a noise gate (see CLAUDE.md). Check the doctor's microphone line. |

@@ -219,6 +219,12 @@ screen under the mouse. Esc closes it.
   _open_and_configure); the preview repaints on frame_ready, not a timer.
 - The webcam is screen-captured (the preview circle is part of the
   framebuffer), NOT composited: compositing gave a second offset circle.
+- Consequence (blurry-face complaint, 2026-09-03): the circle's on-screen
+  pixels ARE the video pixels. WebcamPreviewWidget therefore renders the
+  frame at the screen's physical resolution (devicePixelRatioF, DPR-tagged
+  pixmap, INTER_AREA downscale), defaults to radius 110 and resizes with
+  the mouse wheel (config webcam_radius). Encoder is veryfast / crf 20
+  (ultrafast / 23 smeared small detail).
 
 ### Frameless overlay lands ~20px too high (pre-show move() drifts)
 - A move() issued before the native window is shown drifts upward ~20px.

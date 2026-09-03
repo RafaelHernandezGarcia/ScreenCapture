@@ -9,6 +9,7 @@ Keys in use:
     camera_index         int, OpenCV device index of the preferred webcam
     recording_size       "native" | "1080p" | "720p"
     webcam_default       bool, start recordings with the webcam circle on
+    webcam_radius        int, radius of the webcam circle in logical px (wheel resizes)
     mic_default          bool, start recordings with the mic on
     system_audio         bool, also record what the computer plays (Windows/macOS)
     default_color        "#RRGGBB", annotation color used by new overlays
@@ -26,6 +27,7 @@ DEFAULTS = {
     "camera_index": 0,
     "recording_size": "native",
     "webcam_default": False,
+    "webcam_radius": 110,
     "mic_default": True,
     "system_audio": True,
     "default_color": "#000000",
