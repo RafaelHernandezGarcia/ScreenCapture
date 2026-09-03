@@ -67,7 +67,7 @@ echo.
 "%PYTHON_EXE%" "%SCRIPT_DIR%main.py" --quit >nul 2>&1
 if not errorlevel 1 (
     echo Asked the running copy of ScreenCapture to quit...
-    timeout /t 3 /nobreak >nul
+    ping -n 4 127.0.0.1 >nul
 )
 :: An OLD build (before Sep 2026) holds the port but ignores --quit: ask the user.
 :check_running
@@ -75,7 +75,7 @@ if not errorlevel 1 (
 if not errorlevel 1 (
     if defined QUIET (
         echo Waiting for the running copy to exit...
-        timeout /t 2 /nobreak >nul
+        ping -n 3 127.0.0.1 >nul
         goto :check_running
     )
     echo.
