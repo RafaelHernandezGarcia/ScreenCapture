@@ -137,6 +137,12 @@ for _c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
 for _d in "0123456789":
     _WIN_VK[_d] = ord(_d)
 
+# Keys safe to register WITHOUT a modifier: F-keys and keys nobody types
+# with. A bare letter / digit / Space / Home... would be swallowed system-wide.
+_WIN_BARE_OK = {k for k in _WIN_VK if k[0] == "F" and k[1:].isdigit()} | {
+    "PRINT", "PRINTSCREEN", "SYSREQ", "PAUSE", "SCROLLLOCK", "NUMLOCK", "INSERT", "INS",
+}
+
 _MOD_ALIASES = {
     "CTRL": "Ctrl", "CONTROL": "Ctrl", "SHIFT": "Shift", "ALT": "Alt",
     "OPTION": "Alt", "META": "Meta", "WIN": "Meta", "WINDOWS": "Meta",
@@ -298,8 +304,25 @@ class HotkeyDialog(QDialog):
         # Normalise Qt spellings to our parser's vocabulary
         seq = seq.replace("Print Screen", "Print").replace("ScrollLock", "Scroll Lock")
         mods_list, k = parse_hotkey(seq)
-        if IS_WINDOWS and k not in _WIN_VK:
+        if IS_WINDOWS:
+            usable = k in _WIN_VK
+            bare_ok = k in _WIN_BARE_OK
+        elif IS_MACOS:
+            from sc.hotkey import lookup as _mac_lookup, BARE_OK as _mac_bare_ok
+            usable = _mac_lookup(k) is not None
+            bare_ok = k in _mac_bare_ok
+        else:
+            usable, bare_ok = True, True
+        if not usable:
             self.instruction.setText(f"'{seq}' cannot be used as a global shortcut. Try another key.")
+            self.instruction.setStyleSheet("color: #b00020;")
+            return
+        if not mods_list and not bare_ok:
+            # A bare letter/digit would be swallowed system-wide (you could
+            # not type it anywhere). Ask for a modifier.
+            self.instruction.setText(
+                f"'{seq}' alone would block that key everywhere. "
+                "Add a modifier (e.g. Ctrl+Shift+S) or use an F-key.")
             self.instruction.setStyleSheet("color: #b00020;")
             return
         self.recorded_key_name = "+".join(mods_list + [k if len(k) > 1 else k])
@@ -639,23 +662,34 @@ class ScreenCaptureApp:
             self._notify(self._win_hotkey.last_error +
                          " Pick another one under Capture Shortcut.", ms=6000, critical=True)
 
-    def _setup_hotkey_macos(self):
-        """Register hotkey using Carbon RegisterEventHotKey (no Accessibility needed)."""
-        from sc.hotkey import HotkeyManager, VK, CMD_KEY, SHIFT_KEY, OPTION_KEY, CONTROL_KEY
+    def _setup_hotkey_macos(self, fallback=True):
+        """Register hotkey using Carbon RegisterEventHotKey (no Accessibility needed).
+
+        Raises if the name is not a usable key or the combination is already
+        taken by another app. With fallback=True (startup) an unusable name
+        falls back to F13 so the app always has SOME capture key.
+        """
+        from sc.hotkey import HotkeyManager, lookup, CMD_KEY, SHIFT_KEY, OPTION_KEY, CONTROL_KEY
         mods, key = parse_hotkey(self.hotkey_name)
-        vk = VK.get(key.capitalize(), 105)  # "F13" -> "F13", "PRINT" -> "Print"; default F13
+        vk = lookup(key)
+        if vk is None:
+            if not fallback:
+                raise ValueError(f"'{self.hotkey_name}' is not a key macOS can register")
+            print(f"[hotkey] '{self.hotkey_name}' is not usable on macOS; using F13")
+            self.hotkey_name, mods, vk = "F13", [], lookup("F13")
         # Qt swaps Ctrl/Cmd on macOS: the dialog records Command as "Ctrl"
         # and physical Control as "Meta".
         carbon_mods = 0
         for m in mods:
             carbon_mods |= {"Ctrl": CMD_KEY, "Shift": SHIFT_KEY,
                             "Alt": OPTION_KEY, "Meta": CONTROL_KEY}[m]
-        self._hotkey_mgr = HotkeyManager()
-        self._hotkey_mgr.register(
+        mgr = HotkeyManager()
+        mgr.register(
             vk=vk, modifiers=carbon_mods,
             on_press=lambda: self.signal_emitter.capture_requested.emit(),
             signature="scrn",
         )
+        self._hotkey_mgr = mgr
 
     def _change_hotkey(self):
         """Show dialog to change the hotkey"""
@@ -664,10 +698,21 @@ class ScreenCaptureApp:
             previous = self.hotkey_name
             self.hotkey_name = dlg.recorded_key_name
 
-            if IS_MACOS and self._hotkey_mgr is not None:
-                self._hotkey_mgr.unregister_all()
-                self._hotkey_mgr = None
-                self._setup_hotkey()
+            if IS_MACOS:
+                if self._hotkey_mgr is not None:
+                    self._hotkey_mgr.unregister_all()
+                    self._hotkey_mgr = None
+                try:
+                    self._setup_hotkey_macos(fallback=False)
+                except Exception as e:
+                    self._notify(f"Could not use {pretty_hotkey(self.hotkey_name)}: {e}",
+                                 ms=6000, critical=True)
+                    self.hotkey_name = previous
+                    try:
+                        self._setup_hotkey_macos()
+                    except Exception as e2:
+                        print(f"[hotkey] could not restore {previous}: {e2}")
+                    return
             elif IS_WINDOWS:
                 if not self._win_hotkey.register(self.hotkey_name):
                     self._notify(self._win_hotkey.last_error, ms=5000, critical=True)
@@ -825,7 +870,19 @@ class ScreenCaptureApp:
     # --------------------------------------------------- recording lifecycle
 
     def _to_physical(self, logical_rect: QRect) -> dict:
-        """Logical screen rect -> physical mss region (uses the captured screen's origin)."""
+        """Logical screen rect -> the region handed to mss for recording.
+
+        Windows: mss works in PHYSICAL pixels, so scale from the captured
+        screen's physical origin by the capture DPR.
+        macOS: mss (CGWindowListCreateImage) takes the region in POINTS, i.e.
+        the logical rect itself, and returns 1x or 2x pixels depending on the
+        display; the recorder measures that from its first grab. Multiplying
+        here doubled and shifted the recorded area on a Retina screen and
+        whenever high_res_screenshots made capture_dpr 2.
+        """
+        if IS_MACOS:
+            return {"left": logical_rect.x(), "top": logical_rect.y(),
+                    "width": logical_rect.width(), "height": logical_rect.height()}
         geo = self._last_screen_geo
         dpr = self._last_capture_dpr
         px, py = self._last_phys_origin

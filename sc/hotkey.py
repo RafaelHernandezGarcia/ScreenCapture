@@ -168,12 +168,41 @@ class HotkeyManager:
         return 0  # noErr
 
 
-# Common Mac virtual key codes (from Events.h kVK_*)
+# Mac virtual key codes (Events.h kVK_*), keyed by the UPPERCASE names that
+# main.parse_hotkey produces - the same vocabulary as the Windows table, so a
+# shortcut recorded in the dialog (Cmd+Shift+S, F13, Home...) maps 1:1.
 VK = {
+    # letters (ANSI layout)
+    "A": 0, "S": 1, "D": 2, "F": 3, "H": 4, "G": 5, "Z": 6, "X": 7, "C": 8,
+    "V": 9, "B": 11, "Q": 12, "W": 13, "E": 14, "R": 15, "Y": 16, "T": 17,
+    "O": 31, "U": 32, "I": 34, "P": 35, "L": 37, "J": 38, "K": 40, "N": 45,
+    "M": 46,
+    # digits
+    "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28,
+    "9": 25, "0": 29,
+    # editing / navigation
+    "RETURN": 36, "ENTER": 36, "TAB": 48, "SPACE": 49, "BACKSPACE": 51,
+    "INSERT": 114, "INS": 114, "HOME": 115, "END": 119,
+    "PGUP": 116, "PAGEUP": 116, "PGDOWN": 121, "PAGEDOWN": 121,
+    "DEL": 117, "DELETE": 117,
+    "LEFT": 123, "RIGHT": 124, "DOWN": 125, "UP": 126,
+    # function keys
     "F1": 122, "F2": 120, "F3": 99,  "F4": 118,
     "F5": 96,  "F6": 97,  "F7": 98,  "F8": 100,
     "F9": 101, "F10": 109,"F11": 103,"F12": 111,
     "F13": 105,"F14": 107,"F15": 113,"F16": 106,
     "F17": 64, "F18": 79, "F19": 80, "F20": 90,
-    "Print": 105,  # MS extended-keyboards send F13 for Print Screen
+    # MS extended keyboards send F13 for Print Screen
+    "PRINT": 105, "PRINTSCREEN": 105, "Print": 105,
 }
+
+# Keys that are safe to register WITHOUT a modifier. A bare letter / digit /
+# Space would hijack that key system-wide (you could no longer type it).
+BARE_OK = {k for k in VK if k[0] == "F" and k[1:].isdigit()} | {
+    "PRINT", "PRINTSCREEN", "Print", "INSERT", "INS",
+}
+
+
+def lookup(name: str):
+    """Virtual key code for a parse_hotkey key name (case-insensitive), or None."""
+    return VK.get(str(name).upper(), VK.get(str(name)))

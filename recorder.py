@@ -434,6 +434,27 @@ class ScreenRecorder(QThread):
             self._sys_capture = sys_capture
             self._mic_capture = mic_capture
 
+            # --- Source size / pixel scale ---
+            # macOS: self.region is in POINTS (that is what mss wants there)
+            # and the grab comes back at 1x or 2x depending on the display.
+            # self.dpr from main.py describes the SCREENSHOT, which can differ
+            # (high_res_screenshots uses a 2x CG grab while mss stays 1x), so
+            # measure the real scale with one probe grab. Cursor masks, the
+            # cursor position, annotation scaling and the native output size
+            # all follow the frames actually captured.
+            src_w, src_h = self.region['width'], self.region['height']
+            if IS_MACOS:
+                try:
+                    with mss.mss() as _probe_sct:
+                        _probe = _probe_sct.grab(self.region)
+                    if _probe.width > 0 and self.region['width'] > 0:
+                        self.dpr = _probe.width / self.region['width']
+                        src_w, src_h = _probe.width, _probe.height
+                        print(f"[recording] region {self.region} -> "
+                              f"{src_w}x{src_h} px (scale {self.dpr:g})")
+                except Exception as e:
+                    print(f"[recording] probe grab failed: {e}")
+
             # --- Cursor setup ---
             cursor_black = cursor_white = None
             main_screen_h = 0
@@ -448,11 +469,11 @@ class ScreenRecorder(QThread):
             temp_container = temp_video.replace('.mp4', '.mkv')  # Write to MKV, remux to MP4 later
             # Output resolution: optionally scale to a target height (e.g. 1080p),
             # preserving aspect ratio, with even dimensions (required by H.264).
-            out_w, out_h = self.region['width'], self.region['height']
+            out_w, out_h = src_w - (src_w % 2), src_h - (src_h % 2)
             if self.target_height and out_h != self.target_height:
-                scale = self.target_height / out_h
+                scale = self.target_height / src_h
                 out_h = self.target_height - (self.target_height % 2)
-                out_w = max(2, int(round(self.region['width'] * scale)))
+                out_w = max(2, int(round(src_w * scale)))
                 out_w -= out_w % 2
             self._out_w, self._out_h = out_w, out_h
 

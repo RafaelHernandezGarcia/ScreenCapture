@@ -84,6 +84,15 @@ same key now (they used to be two stores).
   logical units on top. The pixel-size label shows the physical size.
 - Legacy escape hatch: config windows_dpi_scaling = false restores the old
   1:1 physical-pixel Qt (tiny UI, dpr 1).
+- macOS is DIFFERENT (verified 2026-09-06 on a 1080p external primary + the
+  built-in Retina display): mss takes the region in POINTS (= Qt logical
+  coordinates) and returns 1x or 2x pixels depending on the display / the
+  main display's scale. So main._to_physical returns the logical rect
+  unchanged on macOS, and recorder.run measures the real scale with one
+  probe grab (self.dpr = probe.width / region.width) before building cursor
+  masks and the output size. Never multiply a macOS mss region by the DPR:
+  that doubled + shifted the recorded area on Retina and whenever
+  high_res_screenshots (a 2x CG grab) made capture_dpr 2 while mss stayed 1x.
 - The old (Jan 2026) Windows build forced Qt to 1:1 via QT_* env vars; the
   old overlay drew `drawPixmap(rect, screenshot, rect)` which is wrong for any
   dpr != 1 - that is why macOS high_res_screenshots looked "zoomed".
@@ -198,6 +207,12 @@ screen under the mouse. Esc closes it.
 - Same swap in the hotkey dialog: a recorded "Ctrl+..." means Command on
   macOS and is mapped to Carbon CMD_KEY (main._setup_hotkey_macos);
   "Meta" is the physical Control key.
+- sc/hotkey.py VK holds letters, digits, navigation and F-keys keyed by the
+  UPPERCASE names parse_hotkey produces (use sc.hotkey.lookup). It used to
+  hold only F-keys, so "Cmd+Shift+S" silently registered F13. An unusable
+  or already-taken combination now reverts to the previous shortcut with a
+  balloon; the dialog refuses a bare letter/digit on both platforms (it
+  would swallow that key system-wide).
 
 ### Color picker / any dialog opens behind the overlay
 - The overlay sits at NSWindow level 25; dialogs open at the normal level.
@@ -319,10 +334,13 @@ install.bat.
 ---
 
 ## Known remaining work
-- macOS side of the 2026-09-03 refactor (platform_utils.set_click_through
-  keeps the old _configure_nswindow recipe; overlay DPR tagging; hotkey
-  modifiers) is untested on a Mac until the next pull there. Smoke test:
-  hotkey, overlay, Cmd+C, color picker, record with webcam, stop.
+- macOS after the 2026-09-03 refactor, checked 2026-09-06 headlessly on a
+  Mac: overlay render + crop at 1x and 2x (CG grab), recording with
+  ScreenCaptureKit system audio + mic on both screens, camera enumeration,
+  Carbon registration of modifier shortcuts. Still to try BY HAND: pressing
+  the hotkey, Cmd+C in the overlay, the color picker, and a recording with
+  the webcam circle (camera permission for the dev python read
+  not_determined).
 - Lip-sync calibration: webcam_latency_ms 160 may be a touch high.
 - Windows: countdown Esc does not cancel (non-activating overlay).
 - The sc/ native rewrite is incomplete (no annotation / recording).
