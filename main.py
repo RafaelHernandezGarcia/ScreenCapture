@@ -41,7 +41,7 @@ from platform_utils import (
     IS_WINDOWS, IS_MACOS, SYSTEM_FONT, BRAND_PURPLE, BRAND_PURPLE_SOFT,
     INK, CARD_BORDER, physical_screen_rect, reveal_in_file_manager,
     open_folder, recordings_dir, screenshots_dir, set_startup_enabled,
-    startup_enabled, force_foreground,
+    startup_enabled, force_foreground, prefer_tray_icon_position,
 )
 import app_config
 
@@ -494,6 +494,7 @@ class ScreenCaptureApp:
 
     def _setup_tray(self):
         """System tray / menu-bar icon and its menu."""
+        prefer_tray_icon_position()  # macOS: keep it out from behind the notch
         self.tray = QSystemTrayIcon()
         self.tray.setIcon(self._app_icon())
         self.tray.setToolTip(f"{APP_NAME} - press {pretty_hotkey(self.hotkey_name)} to capture")

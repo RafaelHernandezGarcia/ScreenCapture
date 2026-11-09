@@ -393,6 +393,30 @@ def request_camera_permission(callback=None):
             callback(False)
 
 
+def prefer_tray_icon_position(points_from_right=250):
+    """macOS: start the menu-bar icon near the clock instead of the far left.
+
+    Qt never names its NSStatusItem, so macOS gives it the default
+    "Item-0" and no remembered position: every launch it lands in the
+    leftmost slot, which on a notched MacBook with a busy menu bar is
+    hidden behind the camera notch (seen 2026-11-09: app running, icon
+    invisible). Registering a default position makes macOS place it to
+    the right instead. registerDefaults is in-memory for this process
+    only, so other Python menu-bar apps sharing the org.python.python
+    defaults domain (ClipboardHistory, also "Item-0") are unaffected,
+    and a position the user sets by Cmd-dragging the icon still wins.
+    Call before creating the QSystemTrayIcon. No-op elsewhere.
+    """
+    if not IS_MACOS:
+        return
+    try:
+        from Foundation import NSUserDefaults
+        NSUserDefaults.standardUserDefaults().registerDefaults_(
+            {"NSStatusItem Preferred Position Item-0": float(points_from_right)})
+    except Exception as exc:
+        print(f"[tray] could not set preferred icon position: {exc}")
+
+
 def has_accessibility_permission():
     """Best-effort check for macOS Accessibility (required by pynput global hotkeys)."""
     if not IS_MACOS:

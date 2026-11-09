@@ -186,6 +186,21 @@ screen under the mouse. Esc closes it.
   the fixed-path signed binary gives a stable TCC identity so Screen
   Recording / Camera grants stick. Build with `./build.sh`.
 
+### Menu-bar icon hidden behind the camera notch (2026-11-09)
+- Symptom: app running (lock port held, hotkey works) but no feather.
+- Cause: Qt never names its NSStatusItem, so macOS calls it "Item-0" with
+  no remembered position and puts it in the LEFTMOST slot every launch. On
+  a notched MacBook with a full menu bar that slot is under the notch.
+- Fix: platform_utils.prefer_tray_icon_position() registers (in memory,
+  this process only) "NSStatusItem Preferred Position Item-0" before the
+  QSystemTrayIcon is created. Registered, not written: ClipboardHistory
+  runs on the same Python and shares the org.python.python domain and the
+  "Item-0" name (it registers 290, just left of ours at 250). If the bar
+  is still full, the LEFTMOST other icon gets
+  hidden instead; only removing icons (System Settings > Menu Bar) frees
+  room. Check placement headlessly via AXExtrasMenuBar -> AXPosition of
+  the app's pid (x between ~760 and ~970 = under the notch).
+
 ### Capture shows the desktop wallpaper, not the windows
 - Cause: missing Screen Recording permission. macOS silently returns only
   wallpaper + own windows. main.py checks platform_utils.
